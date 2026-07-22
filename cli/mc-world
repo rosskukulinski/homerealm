@@ -1,0 +1,27 @@
+#!/bin/bash
+# mc-world — CLI companion for the homerealm panel (thin client of its API).
+# Usage:
+#   mc-world list
+#   mc-world new <name> [survival|creative|adventure]
+#   mc-world start|stop|restart|delete <name>
+# Set MC_PANEL_URL if the panel isn't on localhost:8090.
+set -euo pipefail
+API=${MC_PANEL_URL:-http://127.0.0.1:8090}
+case "${1:-help}" in
+  list)
+    curl -s "$API/api/worlds" | python3 -c '
+import json, sys
+ws = json.load(sys.stdin)
+print("%-18s %-6s %-10s %-9s %s" % ("WORLD","PORT","MODE","DIFF","STATUS"))
+for w in ws:
+    print("%-18s %-6s %-10s %-9s %s" % (w["name"], w["port"], w["mode"], w["difficulty"], w["status"]))' ;;
+  new)
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+      -d "name=${2:?name required}&mode=${3:-survival}" "$API/new" | grep -q 302 \
+      && echo "world '$2' starting (see panel for port)" || echo "failed (exists? bad name?)" ;;
+  start|stop|restart|delete)
+    cmd=$1; name=${2:?name required}
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST "$API/$cmd/$name" | grep -q 302 \
+      && echo "$cmd $name: ok" || echo "$cmd $name: failed" ;;
+  *) grep '^#   ' "$0" | sed 's/^#   //' ;;
+esac
