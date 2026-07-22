@@ -3,6 +3,8 @@
 **A self-hosted, Realm-style panel for Minecraft Bedrock worlds — built for
 Synology NAS, works anywhere Docker runs.**
 
+![homerealm panel](docs/screenshot.png)
+
 Run as many always-on Bedrock worlds as you like on hardware you own. Manage
 them from a phone-friendly web panel: create worlds from presets or seeds,
 clone them, tune settings, grant kids (or revoke cousins) permissions, stop
