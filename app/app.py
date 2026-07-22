@@ -8,7 +8,11 @@ player permissions, start/stop, delete-to-archive.
 Configuration is via environment variables (see README / .env.example).
 No auth by design — expose only on your LAN or a VPN (e.g. Tailscale).
 """
-import datetime, json, os, re, subprocess
+import datetime
+import json
+import os
+import re
+import subprocess
 from pathlib import Path
 from flask import Flask, request, redirect, Response, jsonify
 
