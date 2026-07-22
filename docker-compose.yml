@@ -1,9 +1,9 @@
 # homerealm panel. Copy .env.example to .env first — see README.
 services:
   homerealm:
-    build: ./app
-    # Once published to GHCR you can use the prebuilt image instead of build:
-    # image: ghcr.io/rosskukulinski/homerealm:latest
+    image: ghcr.io/rosskukulinski/homerealm:latest
+    # To build from source instead, comment the image line and uncomment:
+    # build: ./app
     container_name: homerealm
     restart: unless-stopped
     env_file: .env
