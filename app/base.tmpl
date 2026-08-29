@@ -42,6 +42,7 @@ a { color:var(--sky); }
 .meta { color:var(--meta); font-size:.85rem; }
 .chip { display:inline-flex; align-items:center; gap:.3rem; font-size:.8rem;
   background:var(--chip); color:var(--meta); padding:.2rem .6rem; border-radius:999px; }
+.chip.warn { background:var(--amber-lt); color:var(--amber); font-weight:700; }
 .notice { background:var(--chip); border:1px solid var(--line); border-radius:10px;
   padding:.7rem 1rem; font-size:.9rem; color:var(--meta); margin:.8rem 0; }
 .empty { text-align:center; padding:2.2rem 1rem 1rem; color:var(--meta); }
@@ -206,6 +207,15 @@ async function poll() {
           res.textContent = '\u{1F9E0} ' + w.cpu + ' · ' + w.mem;
         } else {
           res.hidden = true;
+        }
+      }
+      var wc = document.querySelector('[data-warn="' + w.name + '"]');
+      if (wc) {
+        if (w.warn) {
+          wc.hidden = false;
+          wc.textContent = '⚠ ' + w.warn;
+        } else {
+          wc.hidden = true;
         }
       }
     });

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -277,6 +278,56 @@ func TestTailscaleIPsWithoutLocalClient(t *testing.T) {
 	// degrade to "no known IPs" rather than panic on a nil client.
 	if ips := tailscaleIPs(context.Background()); len(ips) != 0 {
 		t.Fatalf("want empty map with no localClient, got %v", ips)
+	}
+}
+
+func TestMintAuthKey(t *testing.T) {
+	var gotAuth, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/oauth/token":
+			r.ParseForm()
+			if r.Form.Get("client_id") != "cid" || r.Form.Get("client_secret") != "csecret" {
+				http.Error(w, "bad creds", 401)
+				return
+			}
+			w.Write([]byte(`{"access_token":"tok123"}`))
+		case "/api/v2/tailnet/-/keys":
+			gotAuth = r.Header.Get("Authorization")
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.Write([]byte(`{"key":"tskey-auth-minted"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	orig := struct{ base, id, secret, tag string }{tsAPIBase, tsOAuthID, tsOAuthSecret, tsTag}
+	t.Cleanup(func() {
+		tsAPIBase, tsOAuthID, tsOAuthSecret, tsTag = orig.base, orig.id, orig.secret, orig.tag
+	})
+	tsAPIBase, tsOAuthID, tsOAuthSecret, tsTag = srv.URL, "cid", "csecret", "tag:test-worlds"
+
+	key, err := mintAuthKey("myworld")
+	if err != nil || key != "tskey-auth-minted" {
+		t.Fatalf("mintAuthKey = %q, %v", key, err)
+	}
+	if gotAuth != "Bearer tok123" {
+		t.Fatalf("keys call auth = %q", gotAuth)
+	}
+	for _, want := range []string{`"tag:test-worlds"`, `"preauthorized":true`, `"reusable":false`, `"homerealm world myworld"`} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("keys request body missing %s:\n%s", want, gotBody)
+		}
+	}
+}
+
+func TestMintAuthKeyNotConfigured(t *testing.T) {
+	orig := struct{ id, secret string }{tsOAuthID, tsOAuthSecret}
+	t.Cleanup(func() { tsOAuthID, tsOAuthSecret = orig.id, orig.secret })
+	tsOAuthID, tsOAuthSecret = "", ""
+	if key, err := mintAuthKey("w"); key != "" || err != nil {
+		t.Fatalf("unconfigured mint = %q, %v; want empty and no error", key, err)
 	}
 }
 

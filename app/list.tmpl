@@ -20,6 +20,7 @@ Tailscale &mdash; open the panel from a Tailscale device to create or manage wor
    <span class="chip">{{.ModeIcon}} {{.Mode}}</span>
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
    {{if and .Owner .CanManage}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
+   <span class="chip warn" data-warn="{{.Name}}"{{if not .Warn}} hidden{{end}}>&#9888; {{.Warn}}</span>
    <span class="chip resource" data-resource="{{.Name}}"{{if or (ne .Status "running") (not .CPU)}} hidden{{end}}>&#129504; {{.CPU}} &middot; {{.Mem}}</span>
   </div>
   <div class="addr-row">

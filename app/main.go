@@ -32,6 +32,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,9 +92,18 @@ var (
 	panelLAN  = getenvBool("PANEL_LISTEN_LAN", true)
 	basePort  = getenvInt("BASE_PORT", 19132) // first world's LAN UDP port
 
-	tsHostname     = getenv("TS_HOSTNAME", "homerealm") // panel's tailnet name
-	tsAuthKey      = os.Getenv("TS_AUTHKEY")
-	bedrockImage   = getenv("BEDROCK_IMAGE", "itzg/minecraft-bedrock-server:latest")
+	tsHostname   = getenv("TS_HOSTNAME", "homerealm") // panel's tailnet name
+	tsAuthKey    = os.Getenv("TS_AUTHKEY")            // static fallback; prefer the OAuth client below
+	bedrockImage = getenv("BEDROCK_IMAGE", "itzg/minecraft-bedrock-server:latest")
+
+	// Tailscale API OAuth client (auth_keys scope, restricted to tsTag).
+	// When set, the panel mints a fresh single-use, pre-authorized, tagged
+	// auth key for each world sidecar — the admin never handles keys, world
+	// nodes belong to the tag rather than a user, and nothing expires.
+	tsOAuthID      = os.Getenv("TS_OAUTH_CLIENT_ID")
+	tsOAuthSecret  = os.Getenv("TS_OAUTH_CLIENT_SECRET")
+	tsTag          = getenv("TS_TAG", "tag:homerealm")
+	tsAPIBase      = getenv("TS_API_BASE", "https://api.tailscale.com") // a var so tests can point at a fake
 	tailscaleImage = getenv("TAILSCALE_IMAGE", "tailscale/tailscale:latest")
 
 	// Optional LAN auto-discovery (macvlan): each world also gets its own LAN
@@ -227,6 +237,40 @@ func worldStatus(name string) string {
 	return st
 }
 
+// sidecarWarn reports why a world's tailscale sidecar can't carry traffic
+// ("" = healthy). The game container can show "running" while its shared
+// network namespace is dead — a sidecar that crash-loops or never logged in
+// takes the world's tailnet *and* LAN presence down with it, so surfacing
+// this next to the game status is what makes the panel honest. A var so
+// tests can stub it without docker.
+var sidecarWarn = func(name string) string {
+	out, err := exec.Command("docker", "inspect", "-f",
+		"{{.State.Status}}|{{.RestartCount}}|{{.State.StartedAt}}", "ts-"+name).Output()
+	if err != nil {
+		return "tailnet sidecar missing — press Restart"
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "|")
+	if parts[0] != "running" {
+		return "tailnet sidecar not running — press Restart"
+	}
+	if len(parts) == 3 {
+		if n, _ := strconv.Atoi(parts[1]); n > 3 {
+			if t, err := time.Parse(time.RFC3339Nano, parts[2]); err == nil && time.Since(t) < 2*time.Minute {
+				return "tailnet sidecar is crash-looping — is an auth key configured?"
+			}
+		}
+	}
+	st, err := exec.Command("docker", "exec", "ts-"+name, "tailscale", "status", "--json", "--peers=false").Output()
+	if err != nil {
+		return "tailnet sidecar not responding"
+	}
+	var s struct{ BackendState string }
+	if json.Unmarshal(st, &s) == nil && (s.BackendState == "NeedsLogin" || s.BackendState == "NoState") {
+		return "tailnet sidecar not signed in — world unreachable; press Restart"
+	}
+	return ""
+}
+
 type dockerStat struct {
 	Name     string `json:"Name"`
 	CPUPerc  string `json:"CPUPerc"`
@@ -311,8 +355,13 @@ func regen() {
 	}
 }
 
-func compose(args ...string) {
+func compose(args ...string) { composeEnv(nil, args...) }
+
+func composeEnv(extraEnv []string, args ...string) {
 	cmd := exec.Command("docker", append([]string{"compose", "-p", project, "-f", composeFile}, args...)...)
+	if extraEnv != nil {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		s := string(out)
@@ -323,10 +372,95 @@ func compose(args ...string) {
 	}
 }
 
+// composeUp brings one world's service pair up (explicitly named — a bare
+// `up -d` would also start deliberately-stopped worlds). With an OAuth
+// client configured it mints a fresh auth key for the sidecar; the key
+// travels only through the compose subprocess's environment, never to
+// disk. A changed key recreates the sidecar (compose sees env drift) —
+// harmless for a logged-in sidecar (TS_AUTH_ONCE ignores the new key) and
+// exactly the fix for one that never managed to log in.
+func composeUp(name string) {
+	var env []string
+	if key, err := mintAuthKey(name); err != nil {
+		log.Printf("mint auth key for %s: %v (falling back to TS_AUTHKEY)", name, err)
+	} else if key != "" {
+		env = []string{"TS_AUTHKEY=" + key}
+	}
+	composeEnv(env, "up", "-d", "ts-"+name, "mc-"+name)
+}
+
 func docker(args ...string) {
 	if err := exec.Command("docker", args...).Run(); err != nil {
 		log.Printf("docker %v: %v", args, err)
 	}
+}
+
+// ---------- tailnet auth keys ----------
+
+func canMint() bool { return tsOAuthID != "" && tsOAuthSecret != "" }
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// mintAuthKey creates a single-use, pre-authorized, tagged tailnet auth key
+// via the Tailscale API, so world sidecars join the tailnet without anyone
+// handling keys by hand. Returns "" (no error) when no OAuth client is
+// configured — callers fall back to the static TS_AUTHKEY.
+func mintAuthKey(world string) (string, error) {
+	if !canMint() {
+		return "", nil
+	}
+	tok, err := oauthToken()
+	if err != nil {
+		return "", err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"capabilities": map[string]any{"devices": map[string]any{"create": map[string]any{
+			"reusable": false, "ephemeral": false, "preauthorized": true,
+			"tags": []string{tsTag},
+		}}},
+		"expirySeconds": 600, // only needs to outlive container startup; node identity persists
+		"description":   "homerealm world " + world,
+	})
+	req, err := http.NewRequest("POST", tsAPIBase+"/api/v2/tailnet/-/keys", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", fmt.Errorf("keys API: %s: %s", resp.Status, b)
+	}
+	var out struct{ Key string }
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Key == "" {
+		return "", fmt.Errorf("keys API: no key in response (%v)", err)
+	}
+	return out.Key, nil
+}
+
+func oauthToken() (string, error) {
+	form := url.Values{"client_id": {tsOAuthID}, "client_secret": {tsOAuthSecret}}
+	resp, err := httpClient.PostForm(tsAPIBase+"/api/v2/oauth/token", form)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", fmt.Errorf("oauth token: %s: %s", resp.Status, b)
+	}
+	var out struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.AccessToken == "" {
+		return "", fmt.Errorf("oauth token: bad response (%v)", err)
+	}
+	return out.AccessToken, nil
 }
 
 // alloc picks the next free LAN port and (if discovery) LAN IP.
@@ -463,6 +597,7 @@ type worldView struct {
 	CanManage          bool
 	CPU, Mem           string // live docker-stats snapshot; empty when not running
 	TailscaleIP        string // the world's own tsnet sidecar IP; empty until it's joined
+	Warn               string // component health: why the world is less alive than Status claims
 }
 
 type section struct {
@@ -492,8 +627,13 @@ type worldPageView struct {
 }
 
 func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP string) worldView {
+	status := worldStatus(wd.Name)
+	warn := ""
+	if status == "running" || status == "starting" {
+		warn = sidecarWarn(wd.Name) // only a "running" game can lie about reachability
+	}
 	return worldView{
-		world: wd, Status: worldStatus(wd.Name),
+		world: wd, Status: status,
 		CheatsStr: strconv.FormatBool(wd.Cheats),
 		Tailnet:   "mc-" + wd.Name,
 		ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
@@ -501,7 +641,7 @@ func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP strin
 		HomeAuto:  discovery && wd.IP != "",
 		CanManage: canManage(login, rl, &wd),
 		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
-		TailscaleIP: tsIP}
+		TailscaleIP: tsIP, Warn: warn}
 }
 
 // tailscaleIPs snapshots each tailnet peer's IP in one Status() call, keyed
@@ -719,12 +859,18 @@ func apiWorlds(w http.ResponseWriter, _ *http.Request) {
 		Tailnet string `json:"tailnet"`
 		CPU     string `json:"cpu,omitempty"`
 		Mem     string `json:"mem,omitempty"`
+		Warn    string `json:"warn,omitempty"`
 	}
 	stats := dockerStats()
 	out := []wireWorld{}
 	for _, wd := range load() {
 		s := stats[wd.Name]
-		out = append(out, wireWorld{wd, worldStatus(wd.Name), "mc-" + wd.Name, s.CPUPerc, s.MemUsage})
+		st := worldStatus(wd.Name)
+		warn := ""
+		if st == "running" || st == "starting" {
+			warn = sidecarWarn(wd.Name)
+		}
+		out = append(out, wireWorld{wd, st, "mc-" + wd.Name, s.CPUPerc, s.MemUsage, warn})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -810,7 +956,7 @@ func newWorld(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(filepath.Join(tsStateRoot, name), 0o700)
 	save(append(ws, wd))
 	regen()
-	compose("up", "-d", "mc-"+name)
+	composeUp(name)
 	back(w, r)
 }
 
@@ -836,7 +982,7 @@ func settings(w http.ResponseWriter, r *http.Request) {
 	wd.ViewDistance = clamp(formInt(r, "view_distance", 10), 5, 32)
 	save(ws)
 	regen()
-	compose("up", "-d", "mc-"+name)
+	composeUp(name)
 	back(w, r)
 }
 
@@ -908,7 +1054,7 @@ func clone(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(filepath.Join(tsStateRoot, newname), 0o700) // fresh tailnet identity
 	save(append(ws, wd))
 	regen()
-	compose("up", "-d", "mc-"+newname)
+	composeUp(newname)
 	back(w, r)
 }
 
@@ -957,7 +1103,17 @@ func ensureSidecar(name string) {
 	}
 	if err := exec.Command("docker", "inspect", "ts-"+name).Run(); err != nil {
 		regen()
-		compose("up", "-d", "mc-"+name)
+		composeUp(name)
+		return
+	}
+	// Self-heal: a sidecar that exists but can't carry traffic (never signed
+	// in, crash-looping) is recreated — with a freshly minted key when an
+	// OAuth client is configured, which is what a stuck login needs. Only
+	// attempted when some key source exists; recreating with no key at all
+	// would just crash-loop again.
+	if sidecarWarn(name) != "" && (canMint() || tsAuthKey != "") {
+		regen()
+		composeUp(name)
 	}
 }
 

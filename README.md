@@ -115,10 +115,21 @@ on the LAN) and create your first world. On devices, add it via
   server sharing the sidecar's network namespace
   (`network_mode: service:`). Tailnet traffic to `mc-<name>:19132/udp`
   lands directly on the server — every world on the same, default port.
-- **Auth keys**: the key is passed to sidecars via compose environment
-  interpolation, never written to disk. Once a node has logged in, its
-  identity persists in its state dir — an expired key only affects *new*
-  worlds, so rotate the key in `.env` whenever it lapses.
+- **Auth keys**: with a Tailscale OAuth client configured
+  (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_CLIENT_SECRET`, `auth_keys` scope
+  restricted to `TS_TAG`), the panel mints a fresh single-use,
+  pre-authorized, tagged key for each world sidecar itself — nobody
+  handles keys, world nodes belong to the tag rather than a person (so
+  their key expiry is auto-disabled), and nothing ever rotates. Keys pass
+  to sidecars via the compose subprocess's environment, never written to
+  disk. Without an OAuth client, the static `TS_AUTHKEY` is the fallback —
+  it expires within 90 days, and an expired key only affects *new* worlds.
+- **Component health**: a world's game container can be "running" while
+  its tailscale sidecar is broken — which would take the world's tailnet
+  *and* LAN reachability down with it. The panel checks the sidecar per
+  world and shows a ⚠ chip when something under the hood is unhealthy;
+  pressing Start/Restart recreates a sidecar that never managed to sign
+  in (minting it a fresh key when an OAuth client is configured).
 - **Deleting a world** archives its data and drops its tailnet state; the
   stale `mc-<name>` machine can be removed in the
   [admin console](https://login.tailscale.com/admin/machines).

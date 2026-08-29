@@ -17,6 +17,7 @@
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
    {{if .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
    {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{end}}
+   <span class="chip warn" data-warn="{{.Name}}"{{if not .Warn}} hidden{{end}}>&#9888; {{.Warn}}</span>
    <span class="chip resource" data-resource="{{.Name}}"{{if or (ne .Status "running") (not .CPU)}} hidden{{end}}>&#129504; {{.CPU}} &middot; {{.Mem}}</span>
   </div>
   <div class="addr-row">
