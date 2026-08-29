@@ -8,7 +8,10 @@
 // (mc-<name>) answering on the default Bedrock port.
 //
 // Configuration is via environment variables (see README / .env.example).
-// Access control is your tailnet's ACLs — the panel itself has no login.
+// There is no login of its own: requests are authorized by Tailscale identity
+// (WhoIs) into three tiers — admins (PANEL_ADMINS) manage everything, other
+// tailnet users create worlds and manage their own, everyone else (LAN
+// listener, tagged nodes) is read-only.
 package main
 
 import (
@@ -96,7 +99,8 @@ type world struct {
 	Name              string `json:"name"`
 	Port              int    `json:"port"`
 	Mode              string `json:"mode"`
-	IP                string `json:"ip,omitempty"` // macvlan LAN IP (discovery)
+	IP                string `json:"ip,omitempty"`    // macvlan LAN IP (discovery)
+	Owner             string `json:"owner,omitempty"` // tailnet login of the creator
 	Difficulty        string `json:"difficulty"`
 	Cheats            bool   `json:"cheats"`
 	MaxPlayers        int    `json:"max_players"`
@@ -347,8 +351,9 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
 <h1>&#9968; homerealm</h1>
 {{if not .Worlds}}<p>No worlds yet — make one below!</p>{{end}}
 {{range .Worlds}}{{$w := .}}<div class="world {{.Status}}">
- <b>{{.Name}}</b> <span class="meta">&middot; {{.Mode}} &middot; {{.Difficulty}} &middot; {{.Status}}</span><br>
- <span class="meta">{{.AddrLine}}</span><br><br>
+ <b>{{.Name}}</b> <span class="meta">&middot; {{.Mode}} &middot; {{.Difficulty}} &middot; {{.Status}}{{if .Owner}} &middot; {{.Owner}}{{end}}</span><br>
+ <span class="meta">{{.AddrLine}}</span>
+ {{if .CanManage}}<br><br>
  {{if eq .Status "running"}}<form class="inline" method="post" action="/stop/{{.Name}}"><button class="neutral">Stop</button></form>{{else}}<form class="inline" method="post" action="/start/{{.Name}}"><button class="go">Start</button></form>{{end}}
  <form class="inline" method="post" action="/restart/{{.Name}}"><button class="neutral">Restart</button></form>
  <form class="inline" method="post" action="/clone/{{.Name}}"
@@ -368,8 +373,11 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
    <button class="go" type="submit">Apply (restarts world)</button>
   </form></details>
  <details><summary>Players</summary>{{if .Players}}<table>{{range .Players}}<tr><td><b>{{.Tag}}</b></td><td><form class="inline" method="post" action="/permission/{{$w.Name}}"><input type="hidden" name="xuid" value="{{.Xuid}}"><select name="level">{{opts $.Perms .Level}}</select> <button class="neutral">Set</button></form></td></tr>{{end}}</table>{{else}}<p class="meta">No one has joined yet — players appear here after their first visit.</p>{{end}}</details>
+ {{else}}
+ <details><summary>Players</summary>{{if .Players}}<table>{{range .Players}}<tr><td><b>{{.Tag}}</b></td><td class="meta">{{.Level}}</td></tr>{{end}}</table>{{else}}<p class="meta">No one has joined yet — players appear here after their first visit.</p>{{end}}</details>
+ {{end}}
 </div>
-{{end}}<div class="newbox"><b>New world</b>
+{{end}}{{if .CanCreate}}<div class="newbox"><b>New world</b>
  <form method="post" action="/new">
   <input name="name" placeholder="world-name" pattern="[a-z0-9-]{1,20}" required>
   <select name="preset">{{range .Presets}}<option value="{{.Key}}">{{.Label}}</option>{{end}}</select>
@@ -378,10 +386,10 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
   <button class="go" type="submit">Create</button>
  </form>
  <div class="meta">lowercase letters, numbers, dashes &middot; ready in ~30s &middot; joins your tailnet as <span class="addr">mc-&lt;name&gt;</span></div>
-</div>
+</div>{{else}}<p class="meta">Read-only view — open the panel from a Tailscale device to create or manage worlds.</p>{{end}}
 <p class="meta">{{.DiscoveryNote}} Settings and permission changes apply with a
 ~20s world restart.</p>
-<footer class="meta">homerealm v{{.Version}}{{if .Identity}} &middot; {{.Identity}} via Tailscale{{end}} &middot;
+<footer class="meta">homerealm v{{.Version}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;
 <a href="https://github.com/rosskukulinski/homerealm">github</a></footer>
 </body></html>`))
 
@@ -393,6 +401,7 @@ type worldView struct {
 	CheatsStr string
 	AddrLine  template.HTML
 	Players   []playerView
+	CanManage bool
 }
 
 type pageView struct {
@@ -400,22 +409,98 @@ type pageView struct {
 	Presets                    []preset
 	Modes, Diffs, Perms, Bools []string
 	DiscoveryNote, Version     string
-	Identity                   string
+	Identity, Role             string
+	CanCreate                  bool
 }
 
 var localClient *local.Client // set once tsnet is up; nil until then
 
-func identity(r *http.Request) string {
+// ---------- auth ----------
+// Three tiers, resolved per request from Tailscale identity (WhoIs):
+//
+//	admin  — logins in PANEL_ADMINS (or any tailnet user if PANEL_ADMINS is
+//	         empty): can do anything
+//	user   — any other tailnet user: create worlds, manage/delete their own,
+//	         read the rest
+//	reader — everyone else (LAN listener, tagged nodes, unknown): read only
+type role int
+
+const (
+	roleReader role = iota
+	roleUser
+	roleAdmin
+)
+
+func (r role) String() string {
+	switch r {
+	case roleAdmin:
+		return "admin"
+	case roleUser:
+		return "user"
+	}
+	return "read-only"
+}
+
+var admins = parseAdmins(os.Getenv("PANEL_ADMINS"))
+
+func parseAdmins(s string) []string {
+	var out []string
+	for _, a := range strings.Split(s, ",") {
+		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// requester resolves who is asking and what they may do. A var so tests can
+// stub identities without a live tailnet.
+var requester = func(r *http.Request) (login string, rl role) {
 	if localClient == nil {
-		return ""
+		return "", roleReader
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	who, err := localClient.WhoIs(ctx, r.RemoteAddr)
-	if err != nil || who.UserProfile == nil {
-		return "" // LAN visitor, or lookup failed
+	if err != nil || who.UserProfile == nil ||
+		(who.Node != nil && len(who.Node.Tags) > 0) {
+		return "", roleReader // LAN visitor, tagged node, or lookup failed
 	}
-	return who.UserProfile.LoginName
+	login = who.UserProfile.LoginName
+	if len(admins) == 0 || contains(admins, strings.ToLower(login)) {
+		return login, roleAdmin
+	}
+	return login, roleUser
+}
+
+// canManage: admins manage everything; users manage the worlds they own.
+// Ownerless worlds (created before ownership existed) are admin-only.
+func canManage(login string, rl role, w *world) bool {
+	return rl == roleAdmin ||
+		(rl == roleUser && w.Owner != "" && strings.EqualFold(w.Owner, login))
+}
+
+// authWorld guards a mutating route on one world: 404 if it doesn't exist,
+// 403 if the requester may not manage it. Returns nil on failure (response
+// already written).
+func authWorld(w http.ResponseWriter, r *http.Request, ws []world, name string) *world {
+	wd := findWorld(ws, name)
+	if wd == nil {
+		http.Error(w, "no such world", 404)
+		return nil
+	}
+	if login, rl := requester(r); !canManage(login, rl, wd) {
+		http.Error(w, "forbidden — not your world (owner: "+orDash(wd.Owner)+")", 403)
+		return nil
+	}
+	return wd
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "unowned"
+	}
+	return s
 }
 
 func playersOf(name string) []playerView {
@@ -439,8 +524,10 @@ func index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	login, rl := requester(r)
 	view := pageView{Presets: presets, Modes: modes, Diffs: diffs, Perms: perms,
-		Bools: []string{"false", "true"}, Version: appVersion, Identity: identity(r)}
+		Bools: []string{"false", "true"}, Version: appVersion,
+		Identity: login, Role: rl.String(), CanCreate: rl >= roleUser}
 	for _, wd := range load() {
 		addr := fmt.Sprintf(`tailnet: <span class="addr">mc-%[1]s</span> &middot; LAN: <span class="addr">&lt;host&gt;:%[2]d</span>`,
 			wd.Name, wd.Port)
@@ -450,7 +537,8 @@ func index(w http.ResponseWriter, r *http.Request) {
 		view.Worlds = append(view.Worlds, worldView{
 			world: wd, Status: worldStatus(wd.Name),
 			CheatsStr: strconv.FormatBool(wd.Cheats),
-			AddrLine:  template.HTML(addr), Players: playersOf(wd.Name)})
+			AddrLine:  template.HTML(addr), Players: playersOf(wd.Name),
+			CanManage: canManage(login, rl, &wd)})
 	}
 	if discovery {
 		view.DiscoveryNote = "Running worlds appear automatically under Friends → LAN Games on devices in the same network."
@@ -499,6 +587,11 @@ func back(w http.ResponseWriter, r *http.Request) {
 }
 
 func newWorld(w http.ResponseWriter, r *http.Request) {
+	login, rl := requester(r)
+	if rl < roleUser {
+		http.Error(w, "forbidden — sign in via Tailscale to create worlds", 403)
+		return
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	ws := load()
@@ -529,6 +622,7 @@ func newWorld(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wd := defaultWorld(name, port, ip, mode)
+	wd.Owner = login
 	wd.Seed = strings.TrimSpace(r.FormValue("seed"))
 	if r.FormValue("flat") != "" {
 		wd.LevelType = "FLAT"
@@ -553,9 +647,8 @@ func settings(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	ws := load()
 	name := r.PathValue("name")
-	wd := findWorld(ws, name)
+	wd := authWorld(w, r, ws, name)
 	if wd == nil {
-		http.Error(w, "no such world", 404)
 		return
 	}
 	mode := formOr(r, "mode", wd.Mode)
@@ -579,8 +672,7 @@ func permission(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	name := r.PathValue("name")
-	if findWorld(load(), name) == nil {
-		http.Error(w, "no such world", 404)
+	if authWorld(w, r, load(), name) == nil {
 		return
 	}
 	xuid, level := r.FormValue("xuid"), r.FormValue("level")
@@ -594,6 +686,7 @@ func permission(w http.ResponseWriter, r *http.Request) {
 }
 
 func clone(w http.ResponseWriter, r *http.Request) {
+	login, rl := requester(r)
 	mu.Lock()
 	defer mu.Unlock()
 	ws := load()
@@ -601,6 +694,11 @@ func clone(w http.ResponseWriter, r *http.Request) {
 	src := findWorld(ws, name)
 	if src == nil {
 		http.Error(w, "no such world", 404)
+		return
+	}
+	// Cloning cold-stops the source for the copy, so it takes manage rights.
+	if !canManage(login, rl, src) {
+		http.Error(w, "forbidden — not your world (owner: "+orDash(src.Owner)+")", 403)
 		return
 	}
 	newname := strings.ToLower(strings.TrimSpace(r.FormValue("newname")))
@@ -634,6 +732,7 @@ func clone(w http.ResponseWriter, r *http.Request) {
 	}
 	wd := *src
 	wd.Name, wd.Port, wd.IP = newname, port, ip
+	wd.Owner = login
 	os.MkdirAll(filepath.Join(tsStateRoot, newname), 0o700) // fresh tailnet identity
 	save(append(ws, wd))
 	regen()
@@ -646,8 +745,7 @@ func deleteWorld(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	ws := load()
 	name := r.PathValue("name")
-	if findWorld(ws, name) == nil {
-		http.Error(w, "no such world", 404)
+	if authWorld(w, r, ws, name) == nil {
 		return
 	}
 	var keep []world
@@ -675,17 +773,29 @@ func deleteWorld(w http.ResponseWriter, r *http.Request) {
 }
 
 func start(w http.ResponseWriter, r *http.Request) {
-	docker("start", "ts-"+r.PathValue("name"), "mc-"+r.PathValue("name"))
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	docker("start", "ts-"+name, "mc-"+name)
 	back(w, r)
 }
 
 func stop(w http.ResponseWriter, r *http.Request) {
-	docker("stop", "mc-"+r.PathValue("name")) // sidecar stays up; node stays reachable
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	docker("stop", "mc-"+name) // sidecar stays up; node stays reachable
 	back(w, r)
 }
 
 func restart(w http.ResponseWriter, r *http.Request) {
-	docker("restart", "mc-"+r.PathValue("name"))
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	docker("restart", "mc-"+name)
 	back(w, r)
 }
 

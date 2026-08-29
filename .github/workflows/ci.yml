@@ -13,12 +13,13 @@ jobs:
         with:
           go-version-file: app/go.mod
           cache-dependency-path: app/go.sum
-      - name: Go build + vet + format
+      - name: Go build + vet + format + test
         working-directory: app
         run: |
           test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
           go vet ./...
           go build ./...
+          go test ./...
       - name: Shell lint
         run: |
           sudo apt-get install -y shellcheck

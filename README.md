@@ -32,6 +32,10 @@ compose file, one small Go binary. No database, no accounts, no cloud.
   each world is its own tailnet machine `mc-<name>` on the default port
   19132, wrapped automatically in a
   [tailscale/tailscale](https://hub.docker.com/r/tailscale/tailscale) sidecar
+- **Roles from Tailscale identity, no passwords** — admins (`PANEL_ADMINS`)
+  manage everything; every other tailnet user can create worlds and
+  manage/delete *their own* (each world remembers its owner); LAN visitors
+  and anyone unidentified get a read-only panel
 - **One world = one server** — switching worlds is just picking a different
   server on your device; worlds hold state whether anyone's online or not
 - **Create** from presets (Survival easy/peaceful/hard, Creative sandbox,
@@ -78,9 +82,10 @@ cd homerealm
 |---|---|
 | `TS_AUTHKEY` | Tailscale auth key — make it **Reusable** (and ideally Pre-approved, tagged e.g. `tag:homerealm`) at [admin/settings/keys](https://login.tailscale.com/admin/settings/keys) |
 | `TS_HOSTNAME` | The panel's tailnet name (default `homerealm`) |
+| `PANEL_ADMINS` | Comma-separated tailnet logins who can manage *everything*; empty = every tailnet user is an admin |
 | `HOST_DATA_DIR` | Where world data lives on the host |
 | `PUID` / `PGID` | Owner for world files — run `id` to find yours |
-| `PANEL_LISTEN_LAN` | Also serve the panel as plain HTTP on the LAN (default `true`) |
+| `PANEL_LISTEN_LAN` | Also serve the panel as plain HTTP on the LAN, read-only (default `true`) |
 | `DISCOVERY_ENABLED` | LAN auto-discovery via macvlan (read below first) |
 
 Open `https://homerealm.<your-tailnet>.ts.net` (or `http://<your-nas>:8090`
@@ -143,28 +148,48 @@ for the open internet.
 
 ## Security model
 
-The panel has **no login of its own** — your tailnet is the front door.
-Anyone who can reach it can start/stop/delete worlds, so scope access with
-[Tailscale ACLs](https://tailscale.com/kb/1018/acls) (the panel shows who's
-connected via Tailscale identity in the footer). `PANEL_LISTEN_LAN=true`
-additionally exposes plain HTTP on your LAN for the CLI and non-Tailscale
-devices at home; set it `false` for tailnet-only. **Never port-forward the
-panel.** (The archive-on-delete design limits the blast radius of curious
-children.)
+The panel has **no login of its own** — your tailnet is the front door, and
+Tailscale identity (WhoIs) decides what each request may do:
+
+| Who | Can |
+|---|---|
+| **Admins** — logins listed in `PANEL_ADMINS` | Everything, on every world |
+| **Tailnet users** — anyone else Tailscale identifies | Create worlds; manage/delete/clone *their own* worlds (each world remembers its owner); read everything else |
+| **Everyone else** — LAN visitors, tagged nodes | Read-only view |
+
+Every rule is enforced server-side on each request, not just hidden in the
+UI; the footer shows who you are and your role. With `PANEL_ADMINS` empty,
+every tailnet user is an admin (the pre-0.2 behavior) — set it to activate
+the tiers. Worlds created before v0.2 have no owner and are admin-only to
+manage (add an `"owner"` in `worlds.json` to hand one over). You can still
+layer [Tailscale ACLs](https://tailscale.com/kb/1018/acls) underneath to
+keep chosen devices away from the panel or from world ports entirely.
+
+`PANEL_LISTEN_LAN=true` additionally exposes plain HTTP on your LAN; since
+LAN requests carry no Tailscale identity they are read-only. Set it `false`
+for tailnet-only. **Never port-forward the panel.** (The archive-on-delete
+design limits the blast radius of curious children.)
 
 ## CLI
 
 ```bash
 cp cli/mc-world /usr/local/bin/ && chmod +x /usr/local/bin/mc-world
-mc-world list
-mc-world new skyblock creative
-mc-world stop skyblock
-# from another tailnet machine:
 MC_PANEL_URL=http://homerealm mc-world list
+MC_PANEL_URL=http://homerealm mc-world new skyblock creative
+MC_PANEL_URL=http://homerealm mc-world stop skyblock
 ```
+
+The CLI inherits your device's Tailscale identity: run it from a tailnet
+machine (`MC_PANEL_URL=http://homerealm`) to create and manage worlds.
+Against the LAN listener (the `127.0.0.1:8090` default) only `list` works —
+LAN requests are read-only.
 
 ## Troubleshooting
 
+- **Panel shows no buttons / actions return 403** — you're read-only. Either
+  you're on the LAN listener (open the panel via its tailnet address
+  instead), or the world belongs to someone else — the footer shows who you
+  are and your role, each world card shows its owner.
 - **World never appears on the tailnet** — check `docker logs ts-<name>`;
   an expired/single-use `TS_AUTHKEY` is the usual cause. Put a fresh
   reusable key in `.env` and restart the sidecar.
