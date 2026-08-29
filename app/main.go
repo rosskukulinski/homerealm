@@ -844,11 +844,29 @@ func deleteWorld(w http.ResponseWriter, r *http.Request) {
 	back(w, r)
 }
 
+// ensureSidecar migrates a world created before the Tailscale sidecar model:
+// Start/Restart otherwise call docker start/restart directly on ts-<name>,
+// which never existed for worlds whose compose entry (and sidecar state
+// dir) was never generated. New/Settings/Clone already do this themselves;
+// this covers the same first-touch case for Start/Restart.
+func ensureSidecar(name string) {
+	stateDir := filepath.Join(tsStateRoot, name)
+	if _, err := os.Stat(stateDir); os.IsNotExist(err) {
+		os.MkdirAll(stateDir, 0o700)
+		own(stateDir)
+	}
+	if err := exec.Command("docker", "inspect", "ts-"+name).Run(); err != nil {
+		regen()
+		compose("up", "-d", "mc-"+name)
+	}
+}
+
 func start(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if authWorld(w, r, load(), name) == nil {
 		return
 	}
+	ensureSidecar(name)
 	docker("start", "ts-"+name, "mc-"+name)
 	back(w, r)
 }
@@ -867,6 +885,7 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	if authWorld(w, r, load(), name) == nil {
 		return
 	}
+	ensureSidecar(name)
 	docker("restart", "mc-"+name)
 	back(w, r)
 }
