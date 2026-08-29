@@ -48,7 +48,11 @@ compose file, one small Go binary. No database, no accounts, no cloud.
   (auto-harvested from server logs); promote to operator or demote to
   visitor from a dropdown
 - **Start / stop / restart** — stopped worlds keep their data, free their
-  RAM, and stay stopped across reboots
+  RAM, and stay stopped across reboots; status badges update live and show
+  *starting* until Bedrock actually accepts players
+- **Feels like an app** — dark mode, phone-first layout, tap-to-copy
+  addresses, and Add-to-Home-Screen support (the icon is pixel art drawn by
+  the binary itself)
 - **Delete = archive** — worlds move to `_archive/` with a timestamp
 - **LAN auto-discovery** (optional): each world gets its own LAN IP via
   macvlan, so all of them show up under "LAN Games" for consoles and other

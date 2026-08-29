@@ -15,11 +15,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html/template"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"net/http"
 	"os"
@@ -82,16 +88,42 @@ var (
 )
 
 type preset struct {
-	Key, Label, Mode, Difficulty string
-	Cheats                       bool
+	Key, Label, Icon, Mode, Difficulty string
+	Cheats                             bool
 }
 
 var presets = []preset{
-	{"survival-easy", "Survival (easy)", "survival", "easy", false},
-	{"survival-peaceful", "Peaceful survival", "survival", "peaceful", false},
-	{"survival-hard", "Hard survival", "survival", "hard", false},
-	{"creative", "Creative sandbox", "creative", "peaceful", true},
-	{"adventure", "Adventure", "adventure", "normal", false},
+	{"survival-easy", "Survival (easy)", "⚔️", "survival", "easy", false},
+	{"survival-peaceful", "Peaceful survival", "🕊️", "survival", "peaceful", false},
+	{"survival-hard", "Hard survival", "💀", "survival", "hard", false},
+	{"creative", "Creative sandbox", "🪄", "creative", "peaceful", true},
+	{"adventure", "Adventure", "🧭", "adventure", "normal", false},
+}
+
+func modeIcon(m string) string {
+	switch m {
+	case "survival":
+		return "⚔️"
+	case "creative":
+		return "🪄"
+	case "adventure":
+		return "🧭"
+	}
+	return "🌍"
+}
+
+func diffIcon(d string) string {
+	switch d {
+	case "peaceful":
+		return "🕊️"
+	case "easy":
+		return "🌤️"
+	case "normal":
+		return "⛅"
+	case "hard":
+		return "💀"
+	}
+	return ""
 }
 
 // ---------- model ----------
@@ -138,12 +170,23 @@ func save(ws []world) {
 	}
 }
 
+// worldStatus reports the container state, refined for running worlds into
+// "starting" until Bedrock has logged readiness — the container is up ~30s
+// before anyone can actually join.
 func worldStatus(name string) string {
-	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", "mc-"+name).Output()
+	out, err := exec.Command("docker", "inspect", "-f",
+		"{{.State.Status}}|{{.State.StartedAt}}", "mc-"+name).Output()
 	if err != nil {
 		return "stopped"
 	}
-	return strings.TrimSpace(string(out))
+	st, startedAt, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
+	if st == "running" && startedAt != "" {
+		logs, _ := exec.Command("docker", "logs", "--since", startedAt, "mc-"+name).CombinedOutput()
+		if !bytes.Contains(logs, []byte("Server started")) {
+			return "starting"
+		}
+	}
+	return st
 }
 
 // regen rewrites the generated compose file: per world, a tailscale/tailscale
@@ -313,6 +356,10 @@ func setPermission(name, xuid, level string) {
 }
 
 // ---------- HTML ----------
+
+//go:embed page.tmpl
+var pageSrc string
+
 var page = template.Must(template.New("page").Funcs(template.FuncMap{
 	"opts": func(values []string, current string) template.HTML {
 		var b strings.Builder
@@ -325,92 +372,60 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
 		}
 		return template.HTML(b.String())
 	},
-}).Parse(`<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>homerealm</title>
-<style>
- body { font-family: -apple-system, sans-serif; max-width: 660px; margin: 2rem auto;
-        padding: 0 1rem; background: #f0f4e8; color: #2d3a2e; }
- h1 { font-size: 1.6rem; } .world { background: white; border-radius: 12px;
-   padding: 1rem 1.2rem; margin: .8rem 0; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
- .running { border-left: 6px solid #5cb85c; }
- .stopped, .exited, .created, .absent { border-left: 6px solid #ccc; }
- .addr { font-family: ui-monospace, monospace; background: #eef; padding: 2px 6px;
-   border-radius: 6px; } button { border: 0; border-radius: 8px; padding: .5rem .9rem;
-   margin-right: .4rem; cursor: pointer; font-size: .9rem; }
- .del { background: #fdd; } .go { background: #cfc; } .neutral { background: #eee; }
- form.inline { display: inline; } .newbox { background: #e2ecd8; border-radius: 12px;
-   padding: 1rem 1.2rem; margin-top: 1.4rem; } input, select { padding: .4rem;
-   border-radius: 8px; border: 1px solid #aaa; font-size: .95rem; margin: 2px; }
- .meta { color: #667; font-size: .85rem; } details { margin-top: .6rem; }
- summary { cursor: pointer; color: #464; font-size: .9rem; }
- table { border-collapse: collapse; margin: .4rem 0; } td { padding: 2px 8px 2px 0; }
- .settings label { font-size: .85rem; margin-right: .6rem; white-space: nowrap; }
- footer { margin-top: 2rem; }
-</style></head><body>
-<h1>&#9968; homerealm</h1>
-{{if not .Worlds}}<p>No worlds yet — make one below!</p>{{end}}
-{{range .Worlds}}{{$w := .}}<div class="world {{.Status}}">
- <b>{{.Name}}</b> <span class="meta">&middot; {{.Mode}} &middot; {{.Difficulty}} &middot; {{.Status}}{{if .Owner}} &middot; {{.Owner}}{{end}}</span><br>
- <span class="meta">{{.AddrLine}}</span>
- {{if .CanManage}}<br><br>
- {{if eq .Status "running"}}<form class="inline" method="post" action="/stop/{{.Name}}"><button class="neutral">Stop</button></form>{{else}}<form class="inline" method="post" action="/start/{{.Name}}"><button class="go">Start</button></form>{{end}}
- <form class="inline" method="post" action="/restart/{{.Name}}"><button class="neutral">Restart</button></form>
- <form class="inline" method="post" action="/clone/{{.Name}}"
-   onsubmit="var n=prompt('Name for the copy:','{{.Name}}-copy');if(!n)return false;this.newname.value=n.trim().toLowerCase();return true;">
-   <input type="hidden" name="newname"><button class="neutral">Clone</button></form>
- <form class="inline" method="post" action="/delete/{{.Name}}"
-   onsubmit="return confirm('Delete world {{.Name}}? (data is archived, not destroyed)')">
-   <button class="del">Delete</button></form>
- <details class="settings"><summary>Settings</summary>
-  <form method="post" action="/settings/{{.Name}}">
-   <label>mode <select name="mode">{{opts $.Modes .Mode}}</select></label>
-   <label>difficulty <select name="difficulty">{{opts $.Diffs .Difficulty}}</select></label>
-   <label>cheats <select name="cheats">{{opts $.Bools .CheatsStr}}</select></label><br>
-   <label>max players <input name="max_players" type="number" min="1" max="30" value="{{.MaxPlayers}}" style="width:4em"></label>
-   <label>view distance <input name="view_distance" type="number" min="5" max="32" value="{{.ViewDistance}}" style="width:4em"></label>
-   <label>new players are <select name="default_permission">{{opts $.Perms .DefaultPermission}}</select></label>
-   <button class="go" type="submit">Apply (restarts world)</button>
-  </form></details>
- <details><summary>Players</summary>{{if .Players}}<table>{{range .Players}}<tr><td><b>{{.Tag}}</b></td><td><form class="inline" method="post" action="/permission/{{$w.Name}}"><input type="hidden" name="xuid" value="{{.Xuid}}"><select name="level">{{opts $.Perms .Level}}</select> <button class="neutral">Set</button></form></td></tr>{{end}}</table>{{else}}<p class="meta">No one has joined yet — players appear here after their first visit.</p>{{end}}</details>
- {{else}}
- <details><summary>Players</summary>{{if .Players}}<table>{{range .Players}}<tr><td><b>{{.Tag}}</b></td><td class="meta">{{.Level}}</td></tr>{{end}}</table>{{else}}<p class="meta">No one has joined yet — players appear here after their first visit.</p>{{end}}</details>
- {{end}}
-</div>
-{{end}}{{if .CanCreate}}<div class="newbox"><b>New world</b>
- <form method="post" action="/new">
-  <input name="name" placeholder="world-name" pattern="[a-z0-9-]{1,20}" required>
-  <select name="preset">{{range .Presets}}<option value="{{.Key}}">{{.Label}}</option>{{end}}</select>
-  <input name="seed" placeholder="seed (optional)" size="12">
-  <label><input type="checkbox" name="flat"> flat</label>
-  <button class="go" type="submit">Create</button>
- </form>
- <div class="meta">lowercase letters, numbers, dashes &middot; ready in ~30s &middot; joins your tailnet as <span class="addr">mc-&lt;name&gt;</span></div>
-</div>{{else}}<p class="meta">Read-only view — open the panel from a Tailscale device to create or manage worlds.</p>{{end}}
-<p class="meta">{{.DiscoveryNote}} Settings and permission changes apply with a
-~20s world restart.</p>
-<footer class="meta">homerealm v{{.Version}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;
-<a href="https://github.com/rosskukulinski/homerealm">github</a></footer>
-</body></html>`))
+	"initial": func(s string) string {
+		for _, r := range s {
+			return strings.ToUpper(string(r))
+		}
+		return "?"
+	},
+}).Parse(pageSrc))
 
 type playerView struct{ Xuid, Tag, Level string }
 
 type worldView struct {
 	world
-	Status    string
-	CheatsStr string
-	AddrLine  template.HTML
-	Players   []playerView
-	CanManage bool
+	Status             string
+	CheatsStr          string
+	Tailnet            string
+	ModeIcon, DiffIcon string
+	Strip              template.CSS // per-world terrain banner gradient
+	HomeAuto           bool         // discovery: appears under LAN Games
+	Players            []playerView
+	CanManage          bool
+}
+
+type section struct {
+	Title  string
+	Worlds []worldView
 }
 
 type pageView struct {
-	Worlds                     []worldView
+	Sections                   []section
+	HasWorlds                  bool
 	Presets                    []preset
 	Modes, Diffs, Perms, Bools []string
 	DiscoveryNote, Version     string
 	Identity, Role             string
-	CanCreate                  bool
+	CanCreate, IsReader        bool
+}
+
+// terrain renders a deterministic strip of "blocks" from the world's name, so
+// every card gets a recognizable banner without any image assets.
+func terrain(name string) template.CSS {
+	pal := []string{"#4c9a2e", "#57b13a", "#3a7a21", "#8a5a32", "#75492a",
+		"#8e8e85", "#a5a59b", "#d9c98e", "#5aa9d6"}
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	r := h.Sum32()
+	const n = 14
+	stops := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		r = r*1664525 + 1013904223 // LCG walk from the name's hash
+		c := pal[r%uint32(len(pal))]
+		stops = append(stops, fmt.Sprintf("%s %.2f%% %.2f%%", c,
+			float64(i)*100/n, float64(i+1)*100/n))
+	}
+	return template.CSS("linear-gradient(90deg," + strings.Join(stops, ",") + ")")
 }
 
 var localClient *local.Client // set once tsnet is up; nil until then
@@ -527,18 +542,30 @@ func index(w http.ResponseWriter, r *http.Request) {
 	login, rl := requester(r)
 	view := pageView{Presets: presets, Modes: modes, Diffs: diffs, Perms: perms,
 		Bools: []string{"false", "true"}, Version: appVersion,
-		Identity: login, Role: rl.String(), CanCreate: rl >= roleUser}
+		Identity: login, Role: rl.String(),
+		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
+	var mine, others []worldView
 	for _, wd := range load() {
-		addr := fmt.Sprintf(`tailnet: <span class="addr">mc-%[1]s</span> &middot; LAN: <span class="addr">&lt;host&gt;:%[2]d</span>`,
-			wd.Name, wd.Port)
-		if discovery && wd.IP != "" {
-			addr = "home: auto (LAN Games) &middot; " + addr
-		}
-		view.Worlds = append(view.Worlds, worldView{
+		wv := worldView{
 			world: wd, Status: worldStatus(wd.Name),
 			CheatsStr: strconv.FormatBool(wd.Cheats),
-			AddrLine:  template.HTML(addr), Players: playersOf(wd.Name),
-			CanManage: canManage(login, rl, &wd)})
+			Tailnet:   "mc-" + wd.Name,
+			ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
+			Strip:     terrain(wd.Name),
+			HomeAuto:  discovery && wd.IP != "",
+			Players:   playersOf(wd.Name),
+			CanManage: canManage(login, rl, &wd)}
+		if login != "" && strings.EqualFold(wd.Owner, login) {
+			mine = append(mine, wv)
+		} else {
+			others = append(others, wv)
+		}
+	}
+	view.HasWorlds = len(mine)+len(others) > 0
+	if len(mine) > 0 && len(others) > 0 {
+		view.Sections = []section{{"Your worlds", mine}, {"Everyone else’s", others}}
+	} else if view.HasWorlds {
+		view.Sections = []section{{"", append(mine, others...)}}
 	}
 	if discovery {
 		view.DiscoveryNote = "Running worlds appear automatically under Friends → LAN Games on devices in the same network."
@@ -851,12 +878,90 @@ func clamp(n, lo, hi int) int {
 	return max(lo, min(hi, n))
 }
 
+// ---------- app icon + manifest (Add to Home Screen) ----------
+// The icon is drawn in code — a 16×16 pixel-art mountain scene scaled up —
+// so the binary ships zero image assets.
+func genIcon(px int) []byte {
+	const n = 16
+	sky := color.NRGBA{0x8c, 0xc6, 0xe8, 0xff}
+	snow := color.NRGBA{0xf4, 0xf6, 0xf2, 0xff}
+	stone := color.NRGBA{0x8e, 0x8e, 0x85, 0xff}
+	grass := color.NRGBA{0x4c, 0x9a, 0x2e, 0xff}
+	grassD := color.NRGBA{0x3a, 0x7a, 0x21, 0xff}
+	dirt := color.NRGBA{0x8a, 0x5a, 0x32, 0xff}
+	dirtD := color.NRGBA{0x75, 0x49, 0x2a, 0xff}
+	img := image.NewNRGBA(image.Rect(0, 0, px, px))
+	s := px / n
+	for gy := 0; gy < n; gy++ {
+		for gx := 0; gx < n; gx++ {
+			c := sky
+			dx := gx - 8
+			if dx < 0 {
+				dx = -dx
+			}
+			switch {
+			case gy >= 13:
+				c = dirtD
+				if (gx+gy)%2 == 0 {
+					c = dirt
+				}
+			case gy == 12:
+				c = dirt
+			case gy == 11:
+				c = grassD
+			case gy == 10:
+				c = grass
+			case gy >= 3 && dx <= gy-3: // the mountain, snow-capped
+				c = stone
+				if gy <= 5 {
+					c = snow
+				}
+			}
+			for y := gy * s; y < (gy+1)*s; y++ {
+				for x := gx * s; x < (gx+1)*s; x++ {
+					img.SetNRGBA(x, y, c)
+				}
+			}
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+var icon192, icon512 = genIcon(192), genIcon(512)
+
+func servePNG(b []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(b)
+	}
+}
+
+func manifest(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/manifest+json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"name": "homerealm", "short_name": "homerealm",
+		"start_url": "/", "display": "standalone",
+		"background_color": "#eff0e2", "theme_color": "#4c9a2e",
+		"icons": []map[string]string{
+			{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+			{"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+		},
+	})
+}
+
 // ---------- main ----------
 func routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", index)
 	mux.HandleFunc("GET /api/worlds", apiWorlds)
 	mux.HandleFunc("GET /api/version", apiVersion)
+	mux.HandleFunc("GET /icon-192.png", servePNG(icon192))
+	mux.HandleFunc("GET /icon-512.png", servePNG(icon512))
+	mux.HandleFunc("GET /apple-touch-icon.png", servePNG(icon192))
+	mux.HandleFunc("GET /manifest.webmanifest", manifest)
 	mux.HandleFunc("POST /new", newWorld)
 	mux.HandleFunc("POST /settings/{name}", settings)
 	mux.HandleFunc("POST /permission/{name}", permission)
