@@ -596,7 +596,8 @@ type worldView struct {
 	Players            []playerView
 	CanManage          bool
 	CPU, Mem           string // live docker-stats snapshot; empty when not running
-	TailscaleIP        string // the world's own tsnet sidecar IP; empty until it's joined
+	TailscaleIP        string // the world's own tailnet IP; empty until it's joined
+	TailscaleDNS       string // full MagicDNS name (mc-<name>.<tailnet>.ts.net); empty until joined
 	Warn               string // component health: why the world is less alive than Status claims
 }
 
@@ -626,7 +627,7 @@ type worldPageView struct {
 	Backups                    []backupView
 }
 
-func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP string) worldView {
+func buildWorldView(wd world, login string, rl role, stat dockerStat, peer tsPeer) worldView {
 	status := worldStatus(wd.Name)
 	warn := ""
 	if status == "running" || status == "starting" {
@@ -641,7 +642,7 @@ func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP strin
 		HomeAuto:  discovery && wd.IP != "",
 		CanManage: canManage(login, rl, &wd),
 		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
-		TailscaleIP: tsIP, Warn: warn}
+		TailscaleIP: peer.IP, TailscaleDNS: peer.DNS, Warn: warn}
 }
 
 // tailscaleIPs snapshots each tailnet peer's IP in one Status() call, keyed
@@ -649,8 +650,10 @@ func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP strin
 // registers, matching the "mc-<name>" hostname set in the generated
 // compose file). Peers not yet joined (e.g. a world that was just created)
 // simply won't have an entry, which callers treat as "IP not known yet".
-func tailscaleIPs(ctx context.Context) map[string]string {
-	out := map[string]string{}
+type tsPeer struct{ IP, DNS string }
+
+func tailscalePeers(ctx context.Context) map[string]tsPeer {
+	out := map[string]tsPeer{}
 	if localClient == nil {
 		return out
 	}
@@ -660,7 +663,10 @@ func tailscaleIPs(ctx context.Context) map[string]string {
 	}
 	for _, p := range st.Peer {
 		if len(p.TailscaleIPs) > 0 {
-			out[strings.ToLower(p.HostName)] = p.TailscaleIPs[0].String()
+			out[strings.ToLower(p.HostName)] = tsPeer{
+				IP:  p.TailscaleIPs[0].String(),
+				DNS: strings.TrimSuffix(p.DNSName, "."),
+			}
 		}
 	}
 	return out
@@ -801,10 +807,10 @@ func index(w http.ResponseWriter, r *http.Request) {
 		Identity: login, Role: rl.String(),
 		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
 	stats := dockerStats()
-	ips := tailscaleIPs(r.Context())
+	peers := tailscalePeers(r.Context())
 	var mine, others []worldView
 	for _, wd := range load() {
-		wv := buildWorldView(wd, login, rl, stats[wd.Name], ips["mc-"+wd.Name])
+		wv := buildWorldView(wd, login, rl, stats[wd.Name], peers["mc-"+wd.Name])
 		if login != "" && strings.EqualFold(wd.Owner, login) {
 			mine = append(mine, wv)
 		} else {
@@ -839,7 +845,7 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	wv := buildWorldView(*wd, login, rl, dockerStats()[name], tailscaleIPs(r.Context())["mc-"+name])
+	wv := buildWorldView(*wd, login, rl, dockerStats()[name], tailscalePeers(r.Context())["mc-"+name])
 	wv.Players = playersOf(name)
 	view := worldPageView{worldView: wv,
 		Modes: modes, Diffs: diffs, Perms: perms, Bools: []string{"false", "true"},

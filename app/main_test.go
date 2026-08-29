@@ -272,11 +272,11 @@ func TestWorldDetailOwnerView(t *testing.T) {
 	}
 }
 
-func TestTailscaleIPsWithoutLocalClient(t *testing.T) {
+func TestTailscalePeersWithoutLocalClient(t *testing.T) {
 	// localClient is only set once tsnet actually comes up; before/without
 	// that (as in every test, and briefly on real startup) this must
 	// degrade to "no known IPs" rather than panic on a nil client.
-	if ips := tailscaleIPs(context.Background()); len(ips) != 0 {
+	if ips := tailscalePeers(context.Background()); len(ips) != 0 {
 		t.Fatalf("want empty map with no localClient, got %v", ips)
 	}
 }
