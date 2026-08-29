@@ -48,6 +48,38 @@ import (
 
 const appVersion = "0.2.0"
 
+// Set via -ldflags -X at build time (see Dockerfile); empty when built
+// plainly (e.g. `go run .`), in which case buildLabel renders nothing.
+var (
+	buildCommit = ""
+	buildBranch = ""
+	buildPR     = ""
+)
+
+// buildLabel renders a small, clickable "what's actually running" marker for
+// the footer — the branch/commit/PR a build came from, distinct from the
+// human-assigned appVersion, which doesn't change on every commit.
+func buildLabel() template.HTML {
+	if buildCommit == "" {
+		return ""
+	}
+	short := buildCommit
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	label := template.HTMLEscapeString(short)
+	if buildBranch != "" && buildBranch != "main" {
+		label = template.HTMLEscapeString(buildBranch) + "@" + label
+	}
+	html := fmt.Sprintf(`<a href="https://github.com/rosskukulinski/homerealm/commit/%s">%s</a>`,
+		template.HTMLEscapeString(buildCommit), label)
+	if buildPR != "" {
+		html += fmt.Sprintf(` (<a href="https://github.com/rosskukulinski/homerealm/pull/%s">PR #%s</a>)`,
+			template.HTMLEscapeString(buildPR), template.HTMLEscapeString(buildPR))
+	}
+	return template.HTML(html)
+}
+
 // ---------- configuration ----------
 var (
 	dataDir  = getenv("DATA_DIR", "/data") // inside this container
@@ -430,6 +462,7 @@ type worldView struct {
 	Players            []playerView
 	CanManage          bool
 	CPU, Mem           string // live docker-stats snapshot; empty when not running
+	TailscaleIP        string // the world's own tsnet sidecar IP; empty until it's joined
 }
 
 type section struct {
@@ -442,6 +475,7 @@ type pageView struct {
 	HasWorlds              bool
 	Presets                []preset
 	DiscoveryNote, Version string
+	Build                  template.HTML
 	Identity, Role         string
 	CanCreate, IsReader    bool
 }
@@ -450,12 +484,14 @@ type pageView struct {
 type worldPageView struct {
 	worldView
 	Modes, Diffs, Perms, Bools []string
-	Version, Identity, Role    string
+	Version                    string
+	Build                      template.HTML
+	Identity, Role             string
 	Back                       string
 	Backups                    []backupView
 }
 
-func buildWorldView(wd world, login string, rl role, stat dockerStat) worldView {
+func buildWorldView(wd world, login string, rl role, stat dockerStat, tsIP string) worldView {
 	return worldView{
 		world: wd, Status: worldStatus(wd.Name),
 		CheatsStr: strconv.FormatBool(wd.Cheats),
@@ -464,7 +500,30 @@ func buildWorldView(wd world, login string, rl role, stat dockerStat) worldView 
 		Strip:     terrain(wd.Name),
 		HomeAuto:  discovery && wd.IP != "",
 		CanManage: canManage(login, rl, &wd),
-		CPU:       stat.CPUPerc, Mem: stat.MemUsage}
+		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
+		TailscaleIP: tsIP}
+}
+
+// tailscaleIPs snapshots each tailnet peer's IP in one Status() call, keyed
+// by hostname (lowercased — that's how each world's ts-<name> sidecar
+// registers, matching the "mc-<name>" hostname set in the generated
+// compose file). Peers not yet joined (e.g. a world that was just created)
+// simply won't have an entry, which callers treat as "IP not known yet".
+func tailscaleIPs(ctx context.Context) map[string]string {
+	out := map[string]string{}
+	if localClient == nil {
+		return out
+	}
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return out
+	}
+	for _, p := range st.Peer {
+		if len(p.TailscaleIPs) > 0 {
+			out[strings.ToLower(p.HostName)] = p.TailscaleIPs[0].String()
+		}
+	}
+	return out
 }
 
 // terrain renders a deterministic strip of "blocks" from the world's name, so
@@ -598,13 +657,14 @@ func index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	view := pageView{Presets: presets, Version: appVersion,
+	view := pageView{Presets: presets, Version: appVersion, Build: buildLabel(),
 		Identity: login, Role: rl.String(),
 		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
 	stats := dockerStats()
+	ips := tailscaleIPs(r.Context())
 	var mine, others []worldView
 	for _, wd := range load() {
-		wv := buildWorldView(wd, login, rl, stats[wd.Name])
+		wv := buildWorldView(wd, login, rl, stats[wd.Name], ips["mc-"+wd.Name])
 		if login != "" && strings.EqualFold(wd.Owner, login) {
 			mine = append(mine, wv)
 		} else {
@@ -639,11 +699,11 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	wv := buildWorldView(*wd, login, rl, dockerStats()[name])
+	wv := buildWorldView(*wd, login, rl, dockerStats()[name], tailscaleIPs(r.Context())["mc-"+name])
 	wv.Players = playersOf(name)
 	view := worldPageView{worldView: wv,
 		Modes: modes, Diffs: diffs, Perms: perms, Bools: []string{"false", "true"},
-		Version: appVersion, Identity: login, Role: rl.String(),
+		Version: appVersion, Build: buildLabel(), Identity: login, Role: rl.String(),
 		Back: "/world/" + name, Backups: listBackups(name)}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := worldPage.ExecuteTemplate(w, "base.tmpl", view); err != nil {

@@ -21,8 +21,13 @@
   </div>
   <div class="addr-row">
    <button type="button" class="addr" data-copy="{{.Tailnet}}" title="Copy the tailnet address">{{.Tailnet}} &#10697;</button>
+   {{if .TailscaleIP}}<button type="button" class="addr" data-copy="{{.TailscaleIP}}" title="Copy the Tailscale IP &#8212; more reliable than the hostname in the Minecraft app">{{.TailscaleIP}} &#10697;</button>{{end}}
    <span>port <b>19132</b> via Tailscale</span>
-   <span>&middot; LAN &lt;host&gt;:{{.Port}}</span>
+   {{if .HomeAuto}}
+   <button type="button" class="addr" data-copy="{{.IP}}:19132" title="Copy the LAN address">{{.IP}}:19132 &#10697;</button>
+   {{else}}
+   <span>&middot; LAN &lt;your NAS's IP&gt;:{{.Port}}</span>
+   {{end}}
   </div>
   {{if .CanManage}}
   <div class="actions">

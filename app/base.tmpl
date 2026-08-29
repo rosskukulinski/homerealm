@@ -151,7 +151,7 @@ table.backups form { display:inline; }
 footer { margin-top:2.2rem; }
 </style></head><body>
 {{template "content" .}}
-<footer class="meta">homerealm v{{.Version}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;
+<footer class="meta">homerealm v{{.Version}}{{if .Build}} &middot; {{.Build}}{{end}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;
 <a href="https://github.com/rosskukulinski/homerealm">github</a></footer>
 <script>
 // tap-to-copy address chips (clipboard API, with a fallback for plain-HTTP LAN)

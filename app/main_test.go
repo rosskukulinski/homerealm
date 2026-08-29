@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -267,6 +268,66 @@ func TestWorldDetailOwnerView(t *testing.T) {
 	}
 	if strings.Contains(body, `id="console-log"`) {
 		t.Fatal("stopped world should not render the live console box")
+	}
+}
+
+func TestTailscaleIPsWithoutLocalClient(t *testing.T) {
+	// localClient is only set once tsnet actually comes up; before/without
+	// that (as in every test, and briefly on real startup) this must
+	// degrade to "no known IPs" rather than panic on a nil client.
+	if ips := tailscaleIPs(context.Background()); len(ips) != 0 {
+		t.Fatalf("want empty map with no localClient, got %v", ips)
+	}
+}
+
+func TestBuildLabel(t *testing.T) {
+	orig := struct{ commit, branch, pr string }{buildCommit, buildBranch, buildPR}
+	t.Cleanup(func() { buildCommit, buildBranch, buildPR = orig.commit, orig.branch, orig.pr })
+
+	buildCommit, buildBranch, buildPR = "", "", ""
+	if got := buildLabel(); got != "" {
+		t.Fatalf("no build info: got %q, want empty", got)
+	}
+
+	buildCommit, buildBranch, buildPR = "b76c2500f7a64d39bba101aa43441c76d02f7593", "main", ""
+	got := string(buildLabel())
+	if !strings.Contains(got, "b76c250") || strings.Contains(got, "main@") {
+		t.Fatalf("main branch: got %q", got)
+	}
+	if !strings.Contains(got, `href="https://github.com/rosskukulinski/homerealm/commit/b76c2500f7a64d39bba101aa43441c76d02f7593"`) {
+		t.Fatalf("commit link should use the full sha: got %q", got)
+	}
+
+	buildCommit, buildBranch, buildPR = "b76c2500f7a64d39bba101aa43441c76d02f7593", "console-stats-backups", "2"
+	got = string(buildLabel())
+	for _, want := range []string{"console-stats-backups@b76c250", "PR #2",
+		`href="https://github.com/rosskukulinski/homerealm/pull/2"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("feature branch + PR: got %q, missing %q", got, want)
+		}
+	}
+}
+
+func TestWorldDetailLANAddress(t *testing.T) {
+	mux := setupTest(t)
+	discovery = true
+	t.Cleanup(func() { discovery = false })
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"lanworld"}})
+
+	req := httptest.NewRequest("GET", "/world/lanworld", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, "LAN &lt;") {
+		t.Fatalf("HomeAuto world should not show the generic LAN placeholder:\n%s", body)
+	}
+	ws := load()
+	if ws[0].IP == "" {
+		t.Fatal("expected an allocated macvlan IP")
+	}
+	if !strings.Contains(body, `data-copy="`+ws[0].IP+`:19132"`) {
+		t.Fatalf("expected a copyable real LAN address for %s, got:\n%s", ws[0].IP, body)
 	}
 }
 
