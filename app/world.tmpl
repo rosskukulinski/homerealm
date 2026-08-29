@@ -1,0 +1,79 @@
+{{define "title"}}{{.Name}} · homerealm{{end}}
+{{define "content"}}
+<header>
+ <a class="backlink" href="/">&#8592; worlds</a>
+ {{if .Identity}}<span class="chip" title="your Tailscale identity">&#128100; {{.Identity}} &middot; {{.Role}}</span>{{end}}
+</header>
+<div class="world" data-world="{{.Name}}">
+ <div class="strip hero" style="background:{{.Strip}}"></div>
+ <div class="cardbody">
+  <div class="cardhead">
+   <span class="wname big">{{.Name}}</span>
+   <span class="badge st-{{.Status}}" data-status="{{.Name}}"><i></i>{{.Status}}</span>
+   {{if not .CanManage}}<span class="chip" title="only its owner or an admin can manage this world">&#128274; view only</span>{{end}}
+  </div>
+  <div class="chips">
+   <span class="chip">{{.ModeIcon}} {{.Mode}}</span>
+   <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
+   {{if .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
+   {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{end}}
+  </div>
+  <div class="addr-row">
+   <button type="button" class="addr" data-copy="{{.Tailnet}}" title="Copy the tailnet address">{{.Tailnet}} &#10697;</button>
+   <span>port <b>19132</b> via Tailscale</span>
+   <span>&middot; LAN &lt;host&gt;:{{.Port}}</span>
+  </div>
+  {{if .CanManage}}
+  <div class="actions">
+   {{if or (eq .Status "running") (eq .Status "starting")}}
+   <form method="post" action="/stop/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn primary" data-busy="Stopping&#8230;">&#9724; Stop</button></form>
+   {{else}}
+   <form method="post" action="/start/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn primary" data-busy="Starting&#8230;">&#9654; Start</button></form>
+   {{end}}
+   <form method="post" action="/restart/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn" data-busy="Restarting&#8230;">Restart</button></form>
+   <details class="inlineact"><summary class="btn" role="button">Clone</summary>
+    <form method="post" action="/clone/{{.Name}}" class="inlineform">
+     <input name="newname" placeholder="{{.Name}}-copy" pattern="[a-z0-9-]{1,20}" required aria-label="name for the copy">
+     <button class="btn" data-busy="Cloning&#8230;">Make a copy</button>
+    </form></details>
+  </div>
+  <div class="sectionhead">Settings</div>
+  <form method="post" action="/settings/{{.Name}}" class="settings-form">
+   <input type="hidden" name="back" value="{{.Back}}">
+   <label>mode <select name="mode">{{opts .Modes .Mode}}</select></label>
+   <label>difficulty <select name="difficulty">{{opts .Diffs .Difficulty}}</select></label>
+   <label>cheats <select name="cheats">{{opts .Bools .CheatsStr}}</select></label><br>
+   <label>max players <input name="max_players" type="number" min="1" max="30" value="{{.MaxPlayers}}" style="width:4.5em"></label>
+   <label>view distance <input name="view_distance" type="number" min="5" max="32" value="{{.ViewDistance}}" style="width:4.5em"></label>
+   <label>new players are <select name="default_permission">{{opts .Perms .DefaultPermission}}</select></label><br>
+   <button class="btn primary" data-busy="Applying&#8230;">Apply (restarts world)</button>
+  </form>
+  <div class="sectionhead">Players</div>
+  {{if .Players}}<table class="players">{{$v := .}}{{range .Players}}<tr>
+   <td><span class="pav">{{initial .Tag}}</span><b>{{.Tag}}</b></td>
+   <td><form method="post" action="/permission/{{$v.Name}}" style="display:inline">
+    <input type="hidden" name="back" value="{{$v.Back}}">
+    <input type="hidden" name="xuid" value="{{.Xuid}}">
+    <select name="level" aria-label="permission for {{.Tag}}">{{opts $v.Perms .Level}}</select>
+    <button class="btn" data-busy="&#8230;">Set</button></form></td>
+  </tr>{{end}}</table>
+  {{else}}<p class="meta">No one has joined yet &mdash; players appear here after their first visit.</p>{{end}}
+  <div class="sectionhead danger-head">Danger zone</div>
+  <details class="dangerbox"><summary>Delete this world&#8230;</summary>
+   <form method="post" action="/delete/{{.Name}}">
+    <p class="meta">&#8220;{{.Name}}&#8221; will be archived to <code>_archive/</code> with a timestamp &mdash; nothing is destroyed.</p>
+    <button class="btn del" data-busy="Archiving&#8230;">Yes, archive &#8220;{{.Name}}&#8221;</button>
+   </form>
+  </details>
+  {{else}}
+  <div class="sectionhead">Players</div>
+  {{if .Players}}<table class="players">{{range .Players}}<tr>
+   <td><span class="pav">{{initial .Tag}}</span><b>{{.Tag}}</b></td>
+   <td class="meta">{{.Level}}</td>
+  </tr>{{end}}</table>
+  {{else}}<p class="meta">No one has joined yet &mdash; players appear here after their first visit.</p>{{end}}
+  {{end}}
+ </div>
+</div>
+<p class="meta">Settings and permission changes apply with a ~20s world restart.</p>
+{{end}}

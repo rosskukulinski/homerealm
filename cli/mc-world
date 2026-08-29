@@ -4,7 +4,8 @@
 #   mc-world list
 #   mc-world new <name> [survival|creative|adventure]
 #   mc-world start|stop|restart|delete <name>
-# Set MC_PANEL_URL if the panel isn't on localhost:8090.
+# Set MC_PANEL_URL if the panel isn't on localhost:8090 — e.g. its tailnet
+# address: MC_PANEL_URL=http://homerealm
 set -euo pipefail
 API=${MC_PANEL_URL:-http://127.0.0.1:8090}
 case "${1:-help}" in
@@ -12,9 +13,9 @@ case "${1:-help}" in
     curl -s "$API/api/worlds" | python3 -c '
 import json, sys
 ws = json.load(sys.stdin)
-print("%-18s %-6s %-10s %-9s %s" % ("WORLD","PORT","MODE","DIFF","STATUS"))
+print("%-18s %-14s %-6s %-10s %-9s %s" % ("WORLD","TAILNET","PORT","MODE","DIFF","STATUS"))
 for w in ws:
-    print("%-18s %-6s %-10s %-9s %s" % (w["name"], w["port"], w["mode"], w["difficulty"], w["status"]))' ;;
+    print("%-18s %-14s %-6s %-10s %-9s %s" % (w["name"], w.get("tailnet",""), w["port"], w["mode"], w["difficulty"], w["status"]))' ;;
   new)
     curl -s -o /dev/null -w "%{http_code}\n" -X POST \
       -d "name=${2:?name required}&mode=${3:-survival}" "$API/new" | grep -q 302 \

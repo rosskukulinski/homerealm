@@ -1,0 +1,194 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#4c9a2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>{{block "title" .}}homerealm{{end}}</title>
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>
+:root {
+  --bg:#eff0e2; --card:#fffef7; --ink:#2c3025; --meta:#5d6353; --line:#d8d5bd;
+  --grass:#4c9a2e; --grass-dk:#3a7a21; --grass-lt:#e2f2d4;
+  --stone:#e7e4d3; --stone-dk:#c2bea3; --sky:#5a9fc7;
+  --amber:#8a6d1d; --amber-lt:#f7ecd0;
+  --danger:#c0392b; --danger-dk:#93261b; --danger-lt:#fbe3de;
+  --chip:#eceada; --shadow:rgba(60,60,30,.14);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#181a14; --card:#22251c; --ink:#e8e6d4; --meta:#a3a891; --line:#3a3d2e;
+    --grass:#57b13a; --grass-dk:#3f8a26; --grass-lt:#2b3d22;
+    --stone:#31352a; --stone-dk:#4a4f3d; --sky:#7fb8d8;
+    --amber:#e3c05e; --amber-lt:#3d341a;
+    --danger:#e26a58; --danger-dk:#a33b2b; --danger-lt:#46251f;
+    --chip:#2d3126; --shadow:rgba(0,0,0,.5);
+  }
+}
+* { box-sizing:border-box }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; max-width:680px;
+  margin:0 auto; padding:0 1rem 2rem; background:var(--bg); color:var(--ink); }
+header { display:flex; align-items:center; justify-content:space-between; gap:.8rem;
+  flex-wrap:wrap; margin:1.4rem 0 .8rem; }
+h1 { font-family:'Press Start 2P',ui-monospace,monospace; font-size:1.05rem; margin:0; }
+h2 { font-size:.82rem; text-transform:uppercase; letter-spacing:.08em; color:var(--meta);
+  margin:1.6rem 0 .1rem; }
+a { color:var(--sky); }
+:focus-visible { outline:3px solid var(--sky); outline-offset:2px; }
+.meta { color:var(--meta); font-size:.85rem; }
+.chip { display:inline-flex; align-items:center; gap:.3rem; font-size:.8rem;
+  background:var(--chip); color:var(--meta); padding:.2rem .6rem; border-radius:999px; }
+.notice { background:var(--chip); border:1px solid var(--line); border-radius:10px;
+  padding:.7rem 1rem; font-size:.9rem; color:var(--meta); margin:.8rem 0; }
+.empty { text-align:center; padding:2.2rem 1rem 1rem; color:var(--meta); }
+.empty .bigmoji { font-size:3rem; }
+.backlink { font-size:.95rem; font-weight:700; text-decoration:none; }
+
+/* world cards */
+.world { background:var(--card); border:1px solid var(--line); border-radius:14px;
+  margin:.9rem 0; box-shadow:0 2px 8px var(--shadow); overflow:hidden; }
+.strip { height:10px; }
+.strip.hero { height:26px; }
+.cardbody { padding:.85rem 1.1rem 1rem; }
+.cardhead { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+.wname { font-size:1.25rem; font-weight:800; letter-spacing:-.01em; }
+.wname.big { font-size:1.7rem; }
+a.wlink { color:inherit; text-decoration:none; }
+a.wlink:hover .wname { text-decoration:underline; }
+.chips { display:flex; gap:.4rem; flex-wrap:wrap; margin:.45rem 0 .1rem; }
+.badge { display:inline-flex; align-items:center; gap:.4rem; font-size:.72rem; font-weight:700;
+  text-transform:uppercase; letter-spacing:.05em; padding:.18rem .6rem; border-radius:999px;
+  background:var(--chip); color:var(--meta); }
+.badge i { width:.55rem; height:.55rem; border-radius:50%; background:var(--stone-dk); }
+.badge.st-running { background:var(--grass-lt); color:var(--grass-dk); }
+.badge.st-running i { background:var(--grass); animation:pulse 2s infinite; }
+.badge.st-starting { background:var(--amber-lt); color:var(--amber); }
+.badge.st-starting i { background:var(--amber); animation:pulse 1s infinite; }
+@keyframes pulse { 50% { opacity:.3 } }
+@media (prefers-reduced-motion: reduce) { .badge i { animation:none !important } }
+
+/* address row */
+.addr-row { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
+  margin:.55rem 0 .1rem; font-size:.85rem; color:var(--meta); }
+.addr { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85rem;
+  background:var(--chip); border:1.5px dashed var(--stone-dk); border-radius:7px;
+  padding:.4rem .6rem; min-height:36px; cursor:pointer; color:var(--ink); }
+.addr.copied { background:var(--grass-lt); border-color:var(--grass); color:var(--grass-dk); }
+
+/* buttons */
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:.35rem;
+  min-height:44px; padding:.45rem 1rem; font:inherit; font-weight:600; font-size:.95rem;
+  color:var(--ink); background:var(--stone); border:2px solid var(--stone-dk);
+  border-radius:9px; box-shadow:0 3px 0 var(--stone-dk); cursor:pointer; text-decoration:none; }
+.btn:active { transform:translateY(2px); box-shadow:0 1px 0 var(--stone-dk); }
+.btn.primary { background:var(--grass); border-color:var(--grass-dk);
+  box-shadow:0 3px 0 var(--grass-dk); color:#fff; }
+.btn.primary:active { box-shadow:0 1px 0 var(--grass-dk); }
+.btn.del { background:var(--danger); border-color:var(--danger-dk);
+  box-shadow:0 3px 0 var(--danger-dk); color:#fff; }
+.btn.del:active { box-shadow:0 1px 0 var(--danger-dk); }
+.btn:disabled { opacity:.55; cursor:default; transform:none; }
+.actions { display:flex; gap:.5rem; flex-wrap:wrap; align-items:flex-start; margin-top:.7rem; }
+.actions form { display:inline; }
+
+/* inline clone form */
+details.inlineact summary { list-style:none; }
+details.inlineact summary::-webkit-details-marker { display:none; }
+.inlineform { margin-top:.5rem; display:flex; gap:.4rem; flex-wrap:wrap; }
+
+/* detail page sections */
+.sectionhead { font-size:.82rem; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--meta); margin:1.5rem 0 .6rem; border-bottom:1px solid var(--line);
+  padding-bottom:.35rem; }
+.sectionhead.danger-head { color:var(--danger); border-color:var(--danger); }
+.settings-form label { display:inline-block; font-size:.85rem; color:var(--meta);
+  margin:.3rem .9rem .3rem 0; white-space:nowrap; }
+input, select { font:inherit; font-size:.95rem; padding:.45rem .55rem; border-radius:8px;
+  border:2px solid var(--stone-dk); background:var(--card); color:var(--ink); min-height:42px; }
+.settings-form .btn { margin-top:.5rem; }
+.dangerbox summary { color:var(--danger); font-weight:700; cursor:pointer; font-size:.9rem;
+  min-height:32px; padding:.2rem 0; }
+.dangerbox form { margin-top:.4rem; }
+
+/* players */
+table.players { border-collapse:collapse; margin:.5rem 0 .2rem; }
+table.players td { padding:.3rem .8rem .3rem 0; vertical-align:middle; }
+.pav { display:inline-flex; width:1.9rem; height:1.9rem; border-radius:7px;
+  background:var(--grass-lt); color:var(--grass-dk); font-weight:800;
+  align-items:center; justify-content:center; margin-right:.55rem; }
+
+/* new world */
+.newbox { background:var(--card); border:1px solid var(--line); border-radius:14px;
+  padding:1rem 1.1rem 1.2rem; margin-top:1.6rem; box-shadow:0 2px 8px var(--shadow); }
+.newbox > b { font-size:1.05rem; }
+.presets { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
+  gap:.5rem; margin:.6rem 0; }
+.preset { position:relative; }
+.preset input { position:absolute; opacity:0; inset:0; }
+.preset span { display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:.25rem; border:2px solid var(--stone-dk); border-radius:10px; padding:.6rem .3rem;
+  font-size:.8rem; text-align:center; cursor:pointer; min-height:70px; color:var(--meta); }
+.preset .em { font-size:1.35rem; }
+.preset input:checked + span { border-color:var(--grass); background:var(--grass-lt);
+  color:var(--grass-dk); box-shadow:0 2px 0 var(--grass-dk); font-weight:700; }
+.newrow { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin:.5rem 0; }
+footer { margin-top:2.2rem; }
+</style></head><body>
+{{template "content" .}}
+<footer class="meta">homerealm v{{.Version}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;
+<a href="https://github.com/rosskukulinski/homerealm">github</a></footer>
+<script>
+// tap-to-copy address chips (clipboard API, with a fallback for plain-HTTP LAN)
+document.addEventListener('click', async function (e) {
+  var t = e.target.closest('[data-copy]');
+  if (!t) return;
+  var v = t.getAttribute('data-copy');
+  try { await navigator.clipboard.writeText(v); }
+  catch (_) {
+    var ta = document.createElement('textarea');
+    ta.value = v; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  if (t.dataset.orig == null) t.dataset.orig = t.textContent;
+  t.classList.add('copied'); t.textContent = 'copied!';
+  setTimeout(function () { t.textContent = t.dataset.orig; t.classList.remove('copied'); }, 1200);
+});
+
+// random seed
+var dice = document.getElementById('dice');
+if (dice) dice.addEventListener('click', function () {
+  document.getElementById('seedbox').value = String(Math.floor(Math.random() * 4294967295));
+});
+
+// action feedback: disable + relabel buttons once a form is submitted
+document.addEventListener('submit', function (e) {
+  var f = e.target;
+  setTimeout(function () {
+    f.querySelectorAll('button').forEach(function (b) {
+      b.disabled = true;
+      if (b.dataset.busy) b.innerHTML = b.dataset.busy;
+    });
+  }, 0);
+});
+
+// live status: poll the JSON API and update badges in place
+async function poll() {
+  try {
+    var r = await fetch('/api/worlds');
+    if (!r.ok) return;
+    var ws = await r.json();
+    ws.forEach(function (w) {
+      var b = document.querySelector('[data-status="' + w.name + '"]');
+      if (b && b.className !== 'badge st-' + w.status) {
+        b.className = 'badge st-' + w.status;
+        b.innerHTML = '<i></i>' + w.status;
+      }
+    });
+  } catch (_) {}
+}
+setInterval(poll, 5000);
+</script>
+</body></html>

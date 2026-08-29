@@ -11,14 +11,21 @@ fi
 
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo ">> Created .env from .env.example — edit it (at minimum HOST_DATA_DIR, PUID/PGID),"
+  echo ">> Created .env from .env.example — edit it (at minimum TS_AUTHKEY, HOST_DATA_DIR, PUID/PGID),"
   echo ">> then re-run ./setup.sh"
-  echo ">> Tip: run 'id' to find your PUID/PGID values."
+  echo ">> Tip: run 'id' to find your PUID/PGID values; create a reusable Tailscale"
+  echo ">> auth key at https://login.tailscale.com/admin/settings/keys"
   exit 0
 fi
 
 # shellcheck disable=SC1091
 source .env
+
+if [ -z "${TS_AUTHKEY:-}" ]; then
+  echo ">> WARNING: TS_AUTHKEY is empty. The panel will print a Tailscale login URL"
+  echo ">> in its logs ('docker logs homerealm'), but worlds can't join the tailnet"
+  echo ">> until you set TS_AUTHKEY in .env."
+fi
 
 echo ">> Creating data dir $HOST_DATA_DIR"
 sudo mkdir -p "$HOST_DATA_DIR"
@@ -41,4 +48,7 @@ fi
 
 echo ">> Building and starting the panel"
 sudo "${COMPOSE[@]}" up -d --build
-echo ">> Done. Panel: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):${PANEL_PORT:-8090}"
+echo ">> Done. Panel on your tailnet: http://${TS_HOSTNAME:-homerealm}"
+if [ "${PANEL_LISTEN_LAN:-true}" = "true" ]; then
+  echo ">> And on the LAN: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):${PANEL_PORT:-8090}"
+fi

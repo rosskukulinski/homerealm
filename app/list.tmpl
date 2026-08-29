@@ -1,0 +1,61 @@
+{{define "content"}}
+<header>
+ <h1>&#9968; homerealm</h1>
+ {{if .Identity}}<span class="chip" title="your Tailscale identity">&#128100; {{.Identity}} &middot; {{.Role}}</span>{{end}}
+</header>
+{{if .IsReader}}<div class="notice">&#128274; <b>Read-only view.</b> You&#8217;re not signed in via
+Tailscale &mdash; open the panel from a Tailscale device to create or manage worlds.</div>{{end}}
+{{if not .HasWorlds}}<div class="empty"><div class="bigmoji">&#9968;</div>
+<p><b>No worlds yet.</b><br>Create the first one below &mdash; it&#8217;ll be on your tailnet in about 30 seconds.</p></div>{{end}}
+{{range .Sections}}{{if .Title}}<h2>{{.Title}}</h2>{{end}}
+{{range .Worlds}}<div class="world" data-world="{{.Name}}">
+ <div class="strip" style="background:{{.Strip}}"></div>
+ <div class="cardbody">
+  <div class="cardhead">
+   <a class="wlink" href="/world/{{.Name}}"><span class="wname">{{.Name}}</span></a>
+   <span class="badge st-{{.Status}}" data-status="{{.Name}}"><i></i>{{.Status}}</span>
+   {{if not .CanManage}}<span class="chip" title="only its owner or an admin can manage this world">&#128274; {{if .Owner}}{{.Owner}}{{else}}admins only{{end}}</span>{{end}}
+  </div>
+  <div class="chips">
+   <span class="chip">{{.ModeIcon}} {{.Mode}}</span>
+   <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
+   {{if and .Owner .CanManage}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
+  </div>
+  <div class="addr-row">
+   <button type="button" class="addr" data-copy="{{.Tailnet}}" title="Copy the tailnet address">{{.Tailnet}} &#10697;</button>
+   <span>port <b>19132</b> via Tailscale</span>
+   {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{else}}<span>&middot; LAN &lt;host&gt;:{{.Port}}</span>{{end}}
+  </div>
+  <div class="actions">
+   {{if .CanManage}}
+   {{if or (eq .Status "running") (eq .Status "starting")}}
+   <form method="post" action="/stop/{{.Name}}"><button class="btn primary" data-busy="Stopping&#8230;">&#9724; Stop</button></form>
+   {{else}}
+   <form method="post" action="/start/{{.Name}}"><button class="btn primary" data-busy="Starting&#8230;">&#9654; Start</button></form>
+   {{end}}
+   {{end}}
+   <a class="btn" href="/world/{{.Name}}">{{if .CanManage}}Manage{{else}}View{{end}} &#8594;</a>
+  </div>
+ </div>
+</div>
+{{end}}{{end}}
+{{if .CanCreate}}<div class="newbox"><b>New world</b>
+ <form method="post" action="/new">
+  <div class="newrow">
+   <input name="name" placeholder="world-name" pattern="[a-z0-9-]{1,20}" required aria-label="world name">
+  </div>
+  <div class="presets">
+  {{range .Presets}}<label class="preset"><input type="radio" name="preset" value="{{.Key}}"{{if eq .Key "survival-easy"}} checked{{end}}><span><span class="em">{{.Icon}}</span>{{.Label}}</span></label>{{end}}
+  </div>
+  <div class="newrow">
+   <input name="seed" id="seedbox" placeholder="seed (optional)" size="14">
+   <button type="button" class="btn" id="dice" title="random seed" aria-label="random seed">&#127922;</button>
+   <label class="chip" style="min-height:42px"><input type="checkbox" name="flat" style="min-height:auto"> flat world</label>
+  </div>
+  <button class="btn primary" data-busy="Creating&#8230;">Create world</button>
+ </form>
+ <div class="meta" style="margin-top:.5rem">lowercase letters, numbers, dashes &middot; ready in ~30s &middot;
+ joins your tailnet as <code>mc-&lt;name&gt;</code></div>
+</div>{{end}}
+<p class="meta">{{.DiscoveryNote}}</p>
+{{end}}
