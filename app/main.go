@@ -221,20 +221,33 @@ func save(ws []world) {
 // worldStatus reports the container state, refined for running worlds into
 // "starting" until Bedrock has logged readiness — the container is up ~30s
 // before anyone can actually join.
-func worldStatus(name string) string {
+func worldStatus(name string) string { s, _ := worldStatusVersion(name); return s }
+
+// versionRe matches the Bedrock server's startup announcement, e.g.
+// "[... INFO] Version: 1.26.45.01".
+var versionRe = regexp.MustCompile(`Version:? v?(\d+\.\d+\.\d+(?:\.\d+)?)`)
+
+// worldStatusVersion also extracts the running Bedrock version from the same
+// log read the "starting" refinement already does. Version is empty for
+// stopped worlds — they run VERSION: LATEST, so whatever they logged last
+// time may no longer be what the next start downloads.
+func worldStatusVersion(name string) (status, version string) {
 	out, err := exec.Command("docker", "inspect", "-f",
 		"{{.State.Status}}|{{.State.StartedAt}}", "mc-"+name).Output()
 	if err != nil {
-		return "stopped"
+		return "stopped", ""
 	}
 	st, startedAt, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
 	if st == "running" && startedAt != "" {
 		logs, _ := exec.Command("docker", "logs", "--since", startedAt, "mc-"+name).CombinedOutput()
+		if m := versionRe.FindSubmatch(logs); m != nil {
+			version = string(m[1])
+		}
 		if !bytes.Contains(logs, []byte("Server started")) {
-			return "starting"
+			return "starting", version
 		}
 	}
-	return st
+	return st, version
 }
 
 // sidecarWarn reports why a world's tailscale sidecar can't carry traffic
@@ -379,20 +392,103 @@ func composeEnv(extraEnv []string, args ...string) {
 // disk. A changed key recreates the sidecar (compose sees env drift) —
 // harmless for a logged-in sidecar (TS_AUTH_ONCE ignores the new key) and
 // exactly the fix for one that never managed to log in.
-func composeUp(name string) {
+func composeUp(name string) { composeUpArgs(name, false) }
+
+func composeUpArgs(name string, force bool) {
 	var env []string
 	if key, err := mintAuthKey(name); err != nil {
 		log.Printf("mint auth key for %s: %v (falling back to TS_AUTHKEY)", name, err)
 	} else if key != "" {
 		env = []string{"TS_AUTHKEY=" + key}
 	}
-	composeEnv(env, "up", "-d", "ts-"+name, "mc-"+name)
+	args := []string{"up", "-d"}
+	if force {
+		args = append(args, "--force-recreate")
+	}
+	composeEnv(env, append(args, "ts-"+name, "mc-"+name)...)
 }
 
 func docker(args ...string) {
 	if err := exec.Command("docker", args...).Run(); err != nil {
 		log.Printf("docker %v: %v", args, err)
 	}
+}
+
+// ---------- bedrock version updates ----------
+
+var bedrockLinksURL = getenv("BEDROCK_LINKS_URL",
+	"https://net-secondary.web.minecraft-services.net/api/v1.0/download/links")
+
+var (
+	bedrockLatestMu  sync.Mutex
+	bedrockLatestVal string
+	bedrockLatestAt  time.Time
+)
+
+var bedrockZipRe = regexp.MustCompile(`bedrock-server-(\d+(?:\.\d+)+)\.zip`)
+
+// latestBedrock returns the newest Bedrock server version Mojang publishes —
+// the same API the server image's downloader consults — cached for an hour
+// (failures too, so an offline NAS doesn't retry every page load). "" means
+// "no update hint available", never an error the UI has to handle.
+func latestBedrock() string {
+	bedrockLatestMu.Lock()
+	defer bedrockLatestMu.Unlock()
+	if time.Since(bedrockLatestAt) < time.Hour {
+		return bedrockLatestVal
+	}
+	bedrockLatestAt, bedrockLatestVal = time.Now(), ""
+	resp, err := httpClient.Get(bedrockLinksURL)
+	if err != nil {
+		log.Printf("bedrock version check: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Result struct {
+			Links []struct {
+				DownloadType string `json:"downloadType"`
+				DownloadURL  string `json:"downloadUrl"`
+			} `json:"links"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		log.Printf("bedrock version check: %v", err)
+		return ""
+	}
+	for _, l := range body.Result.Links {
+		if l.DownloadType == "serverBedrockLinux" {
+			if m := bedrockZipRe.FindStringSubmatch(l.DownloadURL); m != nil {
+				bedrockLatestVal = m[1]
+			}
+		}
+	}
+	return bedrockLatestVal
+}
+
+// verEqual compares versions component-wise over the shorter length with
+// leading zeros stripped, because the same release appears as e.g.
+// "1.26.44.3" in server logs and "1.26.44.03" in download URLs. Erring
+// toward "equal" avoids nagging about updates that aren't real.
+func verEqual(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	n := min(len(pa), len(pb))
+	for i := 0; i < n; i++ {
+		if strings.TrimLeft(pa[i], "0") != strings.TrimLeft(pb[i], "0") {
+			return false
+		}
+	}
+	return true
+}
+
+// updateAvailable returns the newer version a running world could restart
+// into, or "" when it's current (or nothing is known either way).
+func updateAvailable(running string) string {
+	latest := latestBedrock()
+	if running == "" || latest == "" || verEqual(running, latest) {
+		return ""
+	}
+	return latest
 }
 
 // ---------- tailnet auth keys ----------
@@ -599,6 +695,8 @@ type worldView struct {
 	TailscaleIP        string // the world's own tailnet IP; empty until it's joined
 	TailscaleDNS       string // full MagicDNS name (mc-<name>.<tailnet>.ts.net); empty until joined
 	Warn               string // component health: why the world is less alive than Status claims
+	MCVersion          string // Bedrock version from the running server's startup log
+	UpdateTo           string // newer Bedrock version available; empty when current/unknown
 }
 
 type section struct {
@@ -628,7 +726,7 @@ type worldPageView struct {
 }
 
 func buildWorldView(wd world, login string, rl role, stat dockerStat, peer tsPeer) worldView {
-	status := worldStatus(wd.Name)
+	status, mcVersion := worldStatusVersion(wd.Name)
 	warn := ""
 	if status == "running" || status == "starting" {
 		warn = sidecarWarn(wd.Name) // only a "running" game can lie about reachability
@@ -642,7 +740,8 @@ func buildWorldView(wd world, login string, rl role, stat dockerStat, peer tsPee
 		HomeAuto:  discovery && wd.IP != "",
 		CanManage: canManage(login, rl, &wd),
 		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
-		TailscaleIP: peer.IP, TailscaleDNS: peer.DNS, Warn: warn}
+		TailscaleIP: peer.IP, TailscaleDNS: peer.DNS, Warn: warn,
+		MCVersion: mcVersion, UpdateTo: updateAvailable(mcVersion)}
 }
 
 // tailscaleIPs snapshots each tailnet peer's IP in one Status() call, keyed
@@ -861,22 +960,24 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 func apiWorlds(w http.ResponseWriter, _ *http.Request) {
 	type wireWorld struct {
 		world
-		Status  string `json:"status"`
-		Tailnet string `json:"tailnet"`
-		CPU     string `json:"cpu,omitempty"`
-		Mem     string `json:"mem,omitempty"`
-		Warn    string `json:"warn,omitempty"`
+		Status    string `json:"status"`
+		Tailnet   string `json:"tailnet"`
+		CPU       string `json:"cpu,omitempty"`
+		Mem       string `json:"mem,omitempty"`
+		Warn      string `json:"warn,omitempty"`
+		MCVersion string `json:"mc_version,omitempty"`
+		UpdateTo  string `json:"update_to,omitempty"`
 	}
 	stats := dockerStats()
 	out := []wireWorld{}
 	for _, wd := range load() {
 		s := stats[wd.Name]
-		st := worldStatus(wd.Name)
+		st, mcv := worldStatusVersion(wd.Name)
 		warn := ""
 		if st == "running" || st == "starting" {
 			warn = sidecarWarn(wd.Name)
 		}
-		out = append(out, wireWorld{wd, st, "mc-" + wd.Name, s.CPUPerc, s.MemUsage, warn})
+		out = append(out, wireWorld{wd, st, "mc-" + wd.Name, s.CPUPerc, s.MemUsage, warn, mcv, updateAvailable(mcv)})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -1149,6 +1250,21 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	}
 	ensureSidecar(name)
 	docker("restart", "mc-"+name)
+	back(w, r)
+}
+
+// updateWorld pulls the latest server image and force-recreates the world's
+// pair — the productized form of "recreate on a fresh image": the recreate
+// picks up both a newer wrapper image and (via VERSION: LATEST) the newest
+// Bedrock, where a plain restart only gets the latter.
+func updateWorld(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	docker("pull", bedrockImage)
+	regen()
+	composeUpArgs(name, true)
 	back(w, r)
 }
 
@@ -1533,6 +1649,7 @@ func routes() *http.ServeMux {
 	mux.HandleFunc("POST /start/{name}", start)
 	mux.HandleFunc("POST /stop/{name}", stop)
 	mux.HandleFunc("POST /restart/{name}", restart)
+	mux.HandleFunc("POST /update/{name}", updateWorld)
 	mux.HandleFunc("GET /console/{name}", consoleStream)
 	mux.HandleFunc("POST /command/{name}", command)
 	mux.HandleFunc("POST /backup/{name}", backupWorld)

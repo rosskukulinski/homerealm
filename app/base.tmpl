@@ -218,6 +218,15 @@ async function poll() {
           wc.hidden = true;
         }
       }
+      var mv = document.querySelector('[data-mcver="' + w.name + '"]');
+      if (mv) {
+        if (w.mc_version) {
+          mv.hidden = false;
+          mv.textContent = '⛏ ' + w.mc_version + (w.update_to ? ' → ' + w.update_to : '');
+        } else {
+          mv.hidden = true;
+        }
+      }
     });
   } catch (_) {}
 }

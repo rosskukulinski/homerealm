@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupTest(t *testing.T) *http.ServeMux {
@@ -328,6 +329,70 @@ func TestMintAuthKeyNotConfigured(t *testing.T) {
 	tsOAuthID, tsOAuthSecret = "", ""
 	if key, err := mintAuthKey("w"); key != "" || err != nil {
 		t.Fatalf("unconfigured mint = %q, %v; want empty and no error", key, err)
+	}
+}
+
+func TestVersionParsing(t *testing.T) {
+	logLine := []byte("[2026-08-29 17:47:00:405 INFO] Version: 1.26.45.01")
+	if m := versionRe.FindSubmatch(logLine); m == nil || string(m[1]) != "1.26.45.01" {
+		t.Fatalf("versionRe on log line = %v", m)
+	}
+	for _, c := range []struct {
+		a, b string
+		eq   bool
+	}{
+		{"1.26.44.3", "1.26.44.03", true}, // zero-padding differs between logs and zip names
+		{"1.26.45", "1.26.45.01", true},   // shorter form must not read as an update
+		{"1.26.44.3", "1.26.45.01", false},
+		{"1.26.44", "1.27.44", false},
+	} {
+		if got := verEqual(c.a, c.b); got != c.eq {
+			t.Fatalf("verEqual(%q, %q) = %v, want %v", c.a, c.b, got, c.eq)
+		}
+	}
+}
+
+func TestLatestBedrock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"result":{"links":[
+			{"downloadType":"serverBedrockWindows","downloadUrl":"https://x/bedrock-server-1.26.45.01.zip"},
+			{"downloadType":"serverBedrockLinux","downloadUrl":"https://x/bedrock-server-1.26.45.01.zip"}]}}`))
+	}))
+	defer srv.Close()
+	orig := struct {
+		url string
+		val string
+		at  time.Time
+	}{bedrockLinksURL, bedrockLatestVal, bedrockLatestAt}
+	t.Cleanup(func() { bedrockLinksURL, bedrockLatestVal, bedrockLatestAt = orig.url, orig.val, orig.at })
+	bedrockLinksURL, bedrockLatestVal, bedrockLatestAt = srv.URL, "", time.Time{}
+
+	if got := latestBedrock(); got != "1.26.45.01" {
+		t.Fatalf("latestBedrock = %q", got)
+	}
+	// updateAvailable: equal (modulo padding) means no update; older means update.
+	if got := updateAvailable("1.26.45.1"); got != "" {
+		t.Fatalf("current version flagged for update: %q", got)
+	}
+	if got := updateAvailable("1.26.44.3"); got != "1.26.45.01" {
+		t.Fatalf("stale version not flagged: %q", got)
+	}
+	if got := updateAvailable(""); got != "" {
+		t.Fatalf("unknown running version must not flag an update: %q", got)
+	}
+}
+
+func TestUpdateRouteAuth(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"upworld"}})
+	as("cousin@example.com", roleUser)
+	if c := post(mux, "/update/upworld", nil); c != 403 {
+		t.Fatalf("other user POST /update = %d, want 403", c)
+	}
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/update/upworld", nil); c != 302 {
+		t.Fatalf("owner POST /update = %d, want 302", c)
 	}
 }
 

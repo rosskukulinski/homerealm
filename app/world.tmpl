@@ -17,6 +17,7 @@
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
    {{if .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
    {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{end}}
+   <span class="chip" data-mcver="{{.Name}}" title="Minecraft Bedrock version &#8212; player devices need the matching app version to join"{{if not .MCVersion}} hidden{{end}}>&#9935; {{.MCVersion}}{{if .UpdateTo}} &#8594; {{.UpdateTo}}{{end}}</span>
    <span class="chip warn" data-warn="{{.Name}}"{{if not .Warn}} hidden{{end}}>&#9888; {{.Warn}}</span>
    <span class="chip resource" data-resource="{{.Name}}"{{if or (ne .Status "running") (not .CPU)}} hidden{{end}}>&#129504; {{.CPU}} &middot; {{.Mem}}</span>
   </div>
@@ -39,6 +40,7 @@
    <form method="post" action="/start/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn primary" data-busy="Starting&#8230;">&#9654; Start</button></form>
    {{end}}
    <form method="post" action="/restart/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn" data-busy="Restarting&#8230;">Restart</button></form>
+   {{if .UpdateTo}}<form method="post" action="/update/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}"><button class="btn" data-busy="Updating&#8230;" title="Pulls the latest server image and recreates the world &#8212; picks up both a new Bedrock version and wrapper fixes">&#11014; Update to {{.UpdateTo}}</button></form>{{end}}
    <details class="inlineact"><summary class="btn" role="button">Clone</summary>
     <form method="post" action="/clone/{{.Name}}" class="inlineform">
      <input name="newname" placeholder="{{.Name}}-copy" pattern="[a-z0-9-]{1,20}" required aria-label="name for the copy">
