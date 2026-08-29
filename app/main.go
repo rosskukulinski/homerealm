@@ -17,7 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -357,10 +357,10 @@ func setPermission(name, xuid, level string) {
 
 // ---------- HTML ----------
 
-//go:embed page.tmpl
-var pageSrc string
+//go:embed base.tmpl list.tmpl world.tmpl
+var tmplFS embed.FS
 
-var page = template.Must(template.New("page").Funcs(template.FuncMap{
+var tmplFuncs = template.FuncMap{
 	"opts": func(values []string, current string) template.HTML {
 		var b strings.Builder
 		for _, v := range values {
@@ -378,7 +378,12 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
 		}
 		return "?"
 	},
-}).Parse(pageSrc))
+}
+
+var (
+	listPage  = template.Must(template.New("base.tmpl").Funcs(tmplFuncs).ParseFS(tmplFS, "base.tmpl", "list.tmpl"))
+	worldPage = template.Must(template.New("base.tmpl").Funcs(tmplFuncs).ParseFS(tmplFS, "base.tmpl", "world.tmpl"))
+)
 
 type playerView struct{ Xuid, Tag, Level string }
 
@@ -400,13 +405,31 @@ type section struct {
 }
 
 type pageView struct {
-	Sections                   []section
-	HasWorlds                  bool
-	Presets                    []preset
+	Sections               []section
+	HasWorlds              bool
+	Presets                []preset
+	DiscoveryNote, Version string
+	Identity, Role         string
+	CanCreate, IsReader    bool
+}
+
+// worldPageView backs the per-world detail page (/world/<name>).
+type worldPageView struct {
+	worldView
 	Modes, Diffs, Perms, Bools []string
-	DiscoveryNote, Version     string
-	Identity, Role             string
-	CanCreate, IsReader        bool
+	Version, Identity, Role    string
+	Back                       string
+}
+
+func buildWorldView(wd world, login string, rl role) worldView {
+	return worldView{
+		world: wd, Status: worldStatus(wd.Name),
+		CheatsStr: strconv.FormatBool(wd.Cheats),
+		Tailnet:   "mc-" + wd.Name,
+		ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
+		Strip:     terrain(wd.Name),
+		HomeAuto:  discovery && wd.IP != "",
+		CanManage: canManage(login, rl, &wd)}
 }
 
 // terrain renders a deterministic strip of "blocks" from the world's name, so
@@ -540,21 +563,12 @@ func index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	view := pageView{Presets: presets, Modes: modes, Diffs: diffs, Perms: perms,
-		Bools: []string{"false", "true"}, Version: appVersion,
+	view := pageView{Presets: presets, Version: appVersion,
 		Identity: login, Role: rl.String(),
 		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
 	var mine, others []worldView
 	for _, wd := range load() {
-		wv := worldView{
-			world: wd, Status: worldStatus(wd.Name),
-			CheatsStr: strconv.FormatBool(wd.Cheats),
-			Tailnet:   "mc-" + wd.Name,
-			ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
-			Strip:     terrain(wd.Name),
-			HomeAuto:  discovery && wd.IP != "",
-			Players:   playersOf(wd.Name),
-			CanManage: canManage(login, rl, &wd)}
+		wv := buildWorldView(wd, login, rl)
 		if login != "" && strings.EqualFold(wd.Owner, login) {
 			mine = append(mine, wv)
 		} else {
@@ -573,7 +587,30 @@ func index(w http.ResponseWriter, r *http.Request) {
 		view.DiscoveryNote = "On Tailscale devices, add worlds via Servers → Add Server with address mc-<name>, port 19132."
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := page.Execute(w, view); err != nil {
+	if err := listPage.ExecuteTemplate(w, "base.tmpl", view); err != nil {
+		log.Printf("render: %v", err)
+	}
+}
+
+// worldDetail renders the per-world management page. Reads are open to
+// everyone who can reach the panel; the template hides controls the
+// requester can't use and every action stays server-enforced.
+func worldDetail(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	wd := findWorld(load(), name)
+	if wd == nil {
+		http.NotFound(w, r)
+		return
+	}
+	login, rl := requester(r)
+	wv := buildWorldView(*wd, login, rl)
+	wv.Players = playersOf(name)
+	view := worldPageView{worldView: wv,
+		Modes: modes, Diffs: diffs, Perms: perms, Bools: []string{"false", "true"},
+		Version: appVersion, Identity: login, Role: rl.String(),
+		Back: "/world/" + name}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := worldPage.ExecuteTemplate(w, "base.tmpl", view); err != nil {
 		log.Printf("render: %v", err)
 	}
 }
@@ -608,9 +645,17 @@ func findWorld(ws []world, name string) *world {
 	return nil
 }
 
-// back redirects like the Flask app did (302 — the CLI greps for it).
+var backRe = regexp.MustCompile(`^/world/[a-z0-9-]{1,20}$`)
+
+// back redirects with 302 (the CLI greps for it) — to the detail page the
+// form came from when it names one (validated, so it can't be an open
+// redirect), otherwise to the list.
 func back(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/", http.StatusFound)
+	to := r.FormValue("back")
+	if !backRe.MatchString(to) {
+		to = "/"
+	}
+	http.Redirect(w, r, to, http.StatusFound)
 }
 
 func newWorld(w http.ResponseWriter, r *http.Request) {
@@ -956,6 +1001,7 @@ func manifest(w http.ResponseWriter, _ *http.Request) {
 func routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", index)
+	mux.HandleFunc("GET /world/{name}", worldDetail)
 	mux.HandleFunc("GET /api/worlds", apiWorlds)
 	mux.HandleFunc("GET /api/version", apiVersion)
 	mux.HandleFunc("GET /icon-192.png", servePNG(icon192))

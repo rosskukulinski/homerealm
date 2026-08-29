@@ -135,3 +135,44 @@ func TestParseAdmins(t *testing.T) {
 		t.Fatal("empty PANEL_ADMINS must parse to no admins")
 	}
 }
+
+func TestWorldDetailPage(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/new", url.Values{"name": {"pageworld"}}); c != 302 {
+		t.Fatalf("create = %d", c)
+	}
+	as("", roleReader)
+	if c := get(mux, "/world/pageworld"); c != 200 {
+		t.Fatalf("reader GET /world/pageworld = %d, want 200", c)
+	}
+	if c := get(mux, "/world/nope"); c != 404 {
+		t.Fatalf("GET /world/nope = %d, want 404", c)
+	}
+}
+
+func TestBackRedirectValidation(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"redir"}})
+
+	req := httptest.NewRequest("POST", "/stop/redir",
+		strings.NewReader(url.Values{"back": {"/world/redir"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); rec.Code != 302 || loc != "/world/redir" {
+		t.Fatalf("back to detail: code=%d loc=%q", rec.Code, loc)
+	}
+
+	for _, bad := range []string{"https://evil.example", "//evil.example", "/world/../etc", "/other"} {
+		req := httptest.NewRequest("POST", "/stop/redir",
+			strings.NewReader(url.Values{"back": {bad}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if loc := rec.Header().Get("Location"); loc != "/" {
+			t.Fatalf("back=%q redirected to %q, want /", bad, loc)
+		}
+	}
+}
