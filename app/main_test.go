@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -69,10 +70,14 @@ func TestRoleEnforcement(t *testing.T) {
 	// Another user can read it but not manage it.
 	as("cousin@example.com", roleUser)
 	for _, p := range []string{"/settings/kidworld", "/stop/kidworld",
-		"/start/kidworld", "/restart/kidworld", "/delete/kidworld"} {
+		"/start/kidworld", "/restart/kidworld", "/delete/kidworld",
+		"/backup/kidworld", "/command/kidworld"} {
 		if c := post(mux, p, nil); c != 403 {
 			t.Fatalf("other user POST %s = %d, want 403", p, c)
 		}
+	}
+	if c := get(mux, "/console/kidworld"); c != 403 {
+		t.Fatalf("other user GET /console = %d, want 403", c)
 	}
 	if c := post(mux, "/clone/kidworld", url.Values{"newname": {"steal"}}); c != 403 {
 		t.Fatalf("other user POST /clone = %d, want 403", c)
@@ -148,6 +153,120 @@ func TestWorldDetailPage(t *testing.T) {
 	}
 	if c := get(mux, "/world/nope"); c != 404 {
 		t.Fatalf("GET /world/nope = %d, want 404", c)
+	}
+}
+
+func TestBackup(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/new", url.Values{"name": {"bkworld"}}); c != 302 {
+		t.Fatalf("create = %d", c)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "bkworld", "marker.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if c := post(mux, "/backup/bkworld", nil); c != 302 {
+		t.Fatalf("backup POST = %d, want 302", c)
+	}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "_backups", "bkworld"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 backup file, got %v (err=%v)", entries, err)
+	}
+	file := entries[0].Name()
+	if !backupFileRe.MatchString(file) {
+		t.Fatalf("backup file name = %q", file)
+	}
+
+	// Owner can download and delete; a non-owner can't reach either.
+	if c := get(mux, "/backup/bkworld/"+file); c != 200 {
+		t.Fatalf("download = %d, want 200", c)
+	}
+	as("cousin@example.com", roleUser)
+	if c := get(mux, "/backup/bkworld/"+file); c != 403 {
+		t.Fatalf("other user download = %d, want 403", c)
+	}
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/backup/bkworld/"+file+"/delete", nil); c != 302 {
+		t.Fatalf("delete = %d, want 302", c)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dataDir, "_backups", "bkworld")); len(entries) != 0 {
+		t.Fatalf("backup file not deleted: %v", entries)
+	}
+}
+
+func TestPruneBackups(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"20260101-000000.tar.gz", "20260102-000000.tar.gz", "20260103-000000.tar.gz"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneBackups(dir, 2)
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("want 2 files after prune, got %v (err=%v)", entries, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "20260101-000000.tar.gz")); !os.IsNotExist(err) {
+		t.Fatal("oldest backup should have been pruned")
+	}
+}
+
+func TestCommand(t *testing.T) {
+	mux := setupTest(t)
+	origSend := sendCommand
+	t.Cleanup(func() { sendCommand = origSend })
+	var gotName string
+	var gotArgs []string
+	sendCommand = func(name string, args []string) error {
+		gotName, gotArgs = name, args
+		return nil
+	}
+
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"cmdworld"}})
+
+	if c := post(mux, "/command/cmdworld", url.Values{"cmd": {""}}); c != 400 {
+		t.Fatalf("empty command = %d, want 400", c)
+	}
+	if c := post(mux, "/command/cmdworld", url.Values{"cmd": {"say hello world"}}); c != 204 {
+		t.Fatalf("owner command = %d, want 204", c)
+	}
+	if gotName != "cmdworld" || len(gotArgs) != 3 || gotArgs[0] != "say" {
+		t.Fatalf("sendCommand called with (%q, %v)", gotName, gotArgs)
+	}
+
+	sendCommand = func(string, []string) error { return errors.New("no such container") }
+	if c := post(mux, "/command/cmdworld", url.Values{"cmd": {"say hi"}}); c != 502 {
+		t.Fatalf("failed send = %d, want 502", c)
+	}
+}
+
+func TestWorldDetailOwnerView(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"detailworld"}})
+
+	req := httptest.NewRequest("GET", "/world/detailworld", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("owner GET /world/detailworld = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// Freshly created worlds are stopped in this docker-less test env, so
+	// the live console box is hidden in favor of its placeholder message —
+	// but the script block (which no-ops without #console-log) still renders.
+	for _, want := range []string{
+		`Start the world to use the live console.`, `new EventSource(`,
+		`action="/backup/detailworld"`, `Back up now`, `No backups yet.`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("owner view missing %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `id="console-log"`) {
+		t.Fatal("stopped world should not render the live console box")
 	}
 }
 

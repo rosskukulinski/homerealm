@@ -15,7 +15,10 @@
 package main
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
@@ -26,6 +29,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -68,6 +72,8 @@ var (
 	worldIPPrefix  = getenv("WORLD_IP_PREFIX", "192.168.1.")
 	worldIPFirst   = getenvInt("WORLD_IP_FIRST", 250)
 	worldIPLast    = getenvInt("WORLD_IP_LAST", 254)
+
+	backupKeep = getenvInt("BACKUP_KEEP", 10) // backups retained per world
 )
 
 const project = "homerealm-worlds" // compose project name
@@ -187,6 +193,32 @@ func worldStatus(name string) string {
 		}
 	}
 	return st
+}
+
+type dockerStat struct {
+	Name     string `json:"Name"`
+	CPUPerc  string `json:"CPUPerc"`
+	MemUsage string `json:"MemUsage"`
+}
+
+// dockerStats snapshots CPU/RAM for every running world in one call (rather
+// than one docker-stats process per world), keyed by world name.
+func dockerStats() map[string]dockerStat {
+	out := map[string]dockerStat{}
+	b, err := exec.Command("docker", "stats", "--no-stream", "--format", "{{json .}}").Output()
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var s dockerStat
+		if line == "" || json.Unmarshal([]byte(line), &s) != nil || !strings.HasPrefix(s.Name, "mc-") {
+			continue
+		}
+		mem, _, _ := strings.Cut(s.MemUsage, " / ") // drop the "/ total" side — it's the host limit, not the world's
+		s.MemUsage = mem
+		out[strings.TrimPrefix(s.Name, "mc-")] = s
+	}
+	return out
 }
 
 // regen rewrites the generated compose file: per world, a tailscale/tailscale
@@ -397,6 +429,7 @@ type worldView struct {
 	HomeAuto           bool         // discovery: appears under LAN Games
 	Players            []playerView
 	CanManage          bool
+	CPU, Mem           string // live docker-stats snapshot; empty when not running
 }
 
 type section struct {
@@ -419,9 +452,10 @@ type worldPageView struct {
 	Modes, Diffs, Perms, Bools []string
 	Version, Identity, Role    string
 	Back                       string
+	Backups                    []backupView
 }
 
-func buildWorldView(wd world, login string, rl role) worldView {
+func buildWorldView(wd world, login string, rl role, stat dockerStat) worldView {
 	return worldView{
 		world: wd, Status: worldStatus(wd.Name),
 		CheatsStr: strconv.FormatBool(wd.Cheats),
@@ -429,7 +463,8 @@ func buildWorldView(wd world, login string, rl role) worldView {
 		ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
 		Strip:     terrain(wd.Name),
 		HomeAuto:  discovery && wd.IP != "",
-		CanManage: canManage(login, rl, &wd)}
+		CanManage: canManage(login, rl, &wd),
+		CPU:       stat.CPUPerc, Mem: stat.MemUsage}
 }
 
 // terrain renders a deterministic strip of "blocks" from the world's name, so
@@ -566,9 +601,10 @@ func index(w http.ResponseWriter, r *http.Request) {
 	view := pageView{Presets: presets, Version: appVersion,
 		Identity: login, Role: rl.String(),
 		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
+	stats := dockerStats()
 	var mine, others []worldView
 	for _, wd := range load() {
-		wv := buildWorldView(wd, login, rl)
+		wv := buildWorldView(wd, login, rl, stats[wd.Name])
 		if login != "" && strings.EqualFold(wd.Owner, login) {
 			mine = append(mine, wv)
 		} else {
@@ -603,12 +639,12 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	wv := buildWorldView(*wd, login, rl)
+	wv := buildWorldView(*wd, login, rl, dockerStats()[name])
 	wv.Players = playersOf(name)
 	view := worldPageView{worldView: wv,
 		Modes: modes, Diffs: diffs, Perms: perms, Bools: []string{"false", "true"},
 		Version: appVersion, Identity: login, Role: rl.String(),
-		Back: "/world/" + name}
+		Back: "/world/" + name, Backups: listBackups(name)}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := worldPage.ExecuteTemplate(w, "base.tmpl", view); err != nil {
 		log.Printf("render: %v", err)
@@ -621,10 +657,14 @@ func apiWorlds(w http.ResponseWriter, _ *http.Request) {
 		world
 		Status  string `json:"status"`
 		Tailnet string `json:"tailnet"`
+		CPU     string `json:"cpu,omitempty"`
+		Mem     string `json:"mem,omitempty"`
 	}
+	stats := dockerStats()
 	out := []wireWorld{}
 	for _, wd := range load() {
-		out = append(out, wireWorld{wd, worldStatus(wd.Name), "mc-" + wd.Name})
+		s := stats[wd.Name]
+		out = append(out, wireWorld{wd, worldStatus(wd.Name), "mc-" + wd.Name, s.CPUPerc, s.MemUsage})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -890,6 +930,242 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	back(w, r)
 }
 
+// ---------- console ----------
+
+// consoleStream tails the world's container log as Server-Sent Events until
+// the client disconnects (which cancels r.Context(), killing the `docker
+// logs -f` subprocess via CommandContext).
+func consoleStream(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	cmd := exec.CommandContext(r.Context(), "docker", "logs", "-f", "--tail", "200", "mc-"+name)
+	pr, pw := io.Pipe()
+	cmd.Stdout, cmd.Stderr = pw, pw
+	if err := cmd.Start(); err != nil {
+		http.Error(w, "world not running", 502)
+		return
+	}
+	go func() { cmd.Wait(); pw.Close() }()
+
+	w.WriteHeader(200)
+	flusher.Flush()
+	sc := bufio.NewScanner(pr)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		fmt.Fprintf(w, "data: %s\n\n", strings.TrimRight(sc.Text(), "\r"))
+		flusher.Flush()
+	}
+}
+
+// sendCommand runs one console command via the itzg image's bundled
+// send-command script (docker exec, not a shell — no injection risk from
+// the split args). A var so tests can stub it without a live container.
+var sendCommand = func(name string, args []string) error {
+	return exec.Command("docker", append([]string{"exec", "mc-" + name, "send-command"}, args...)...).Run()
+}
+
+func command(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	fields := strings.Fields(r.FormValue("cmd"))
+	if len(fields) == 0 || len(fields) > 50 {
+		http.Error(w, "bad command", 400)
+		return
+	}
+	if err := sendCommand(name, fields); err != nil {
+		http.Error(w, "command failed — is the world running?", 502)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+// ---------- backups ----------
+
+type backupView struct{ File, When, Size string }
+
+// backupWorld makes an on-demand backup. Like Clone, it cold-copies (stop,
+// copy, restart) rather than using Bedrock's save-hold/query/resume protocol
+// — simpler and already trusted elsewhere in this codebase; the tradeoff is
+// a few seconds of downtime for a running world.
+func backupWorld(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	wasRunning := worldStatus(name) == "running"
+	if wasRunning {
+		docker("stop", "mc-"+name)
+	}
+	dir := filepath.Join(dataDir, "_backups", name)
+	os.MkdirAll(dir, 0o775)
+	dest := filepath.Join(dir, time.Now().Format("20060102-150405")+".tar.gz")
+	err := tarGzDir(filepath.Join(dataDir, name), dest)
+	if wasRunning {
+		docker("start", "mc-"+name)
+	}
+	if err != nil {
+		os.Remove(dest)
+		log.Printf("backup %s: %v", name, err)
+		http.Error(w, "backup failed", 500)
+		return
+	}
+	own(dir)
+	pruneBackups(dir, backupKeep)
+	back(w, r)
+}
+
+var backupFileRe = regexp.MustCompile(`^\d{8}-\d{6}\.tar\.gz$`)
+
+func downloadBackup(w http.ResponseWriter, r *http.Request) {
+	name, file := r.PathValue("name"), r.PathValue("file")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	if !backupFileRe.MatchString(file) {
+		http.Error(w, "bad filename", 400)
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+"-"+file+`"`)
+	http.ServeFile(w, r, filepath.Join(dataDir, "_backups", name, file))
+}
+
+func deleteBackup(w http.ResponseWriter, r *http.Request) {
+	name, file := r.PathValue("name"), r.PathValue("file")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	if !backupFileRe.MatchString(file) {
+		http.Error(w, "bad filename", 400)
+		return
+	}
+	os.Remove(filepath.Join(dataDir, "_backups", name, file))
+	back(w, r)
+}
+
+// listBackups returns a world's backups, newest first, for the detail page.
+func listBackups(name string) []backupView {
+	entries, err := os.ReadDir(filepath.Join(dataDir, "_backups", name))
+	if err != nil {
+		return nil
+	}
+	var out []backupView
+	for _, e := range entries {
+		if e.IsDir() || !backupFileRe.MatchString(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, backupView{File: e.Name(),
+			When: info.ModTime().Format("Jan 2 15:04"), Size: humanSize(info.Size())})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].File > out[j].File })
+	return out
+}
+
+// pruneBackups keeps only the `keep` most recent backups in dir (filenames
+// are timestamps, so lexicographic order is chronological order).
+func pruneBackups(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && backupFileRe.MatchString(e.Name()) {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+	for len(files) > keep {
+		os.Remove(filepath.Join(dir, files[0]))
+		files = files[1:]
+	}
+}
+
+func humanSize(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(1024), 0
+	for m := n / 1024; m >= 1024; m /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// tarGzDir writes a gzip-compressed tarball of srcDir's contents to
+// destFile. Close errors (e.g. a full disk truncating the write) are
+// surfaced rather than swallowed, since a "successful" backup that's
+// actually corrupt would be worse than an obvious failure.
+func tarGzDir(srcDir, destFile string) (err error) {
+	f, err := os.Create(destFile)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	walkErr := filepath.Walk(srcDir, func(path string, info os.FileInfo, ferr error) error {
+		if ferr != nil {
+			return ferr
+		}
+		rel, relErr := filepath.Rel(srcDir, path)
+		if relErr != nil || rel == "." {
+			return relErr
+		}
+		hdr, hErr := tar.FileInfoHeader(info, "")
+		if hErr != nil {
+			return hErr
+		}
+		hdr.Name = rel
+		if info.IsDir() {
+			hdr.Name += "/"
+		}
+		if wErr := tw.WriteHeader(hdr); wErr != nil {
+			return wErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		file, oErr := os.Open(path)
+		if oErr != nil {
+			return oErr
+		}
+		defer file.Close()
+		_, cErr := io.Copy(tw, file)
+		return cErr
+	})
+	if walkErr != nil {
+		tw.Close()
+		gz.Close()
+		return walkErr
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gz.Close()
+}
+
 // ---------- helpers ----------
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -1035,6 +1311,11 @@ func routes() *http.ServeMux {
 	mux.HandleFunc("POST /start/{name}", start)
 	mux.HandleFunc("POST /stop/{name}", stop)
 	mux.HandleFunc("POST /restart/{name}", restart)
+	mux.HandleFunc("GET /console/{name}", consoleStream)
+	mux.HandleFunc("POST /command/{name}", command)
+	mux.HandleFunc("POST /backup/{name}", backupWorld)
+	mux.HandleFunc("GET /backup/{name}/{file}", downloadBackup)
+	mux.HandleFunc("POST /backup/{name}/{file}/delete", deleteBackup)
 	return mux
 }
 

@@ -17,6 +17,7 @@
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
    {{if .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
    {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{end}}
+   <span class="chip resource" data-resource="{{.Name}}"{{if or (ne .Status "running") (not .CPU)}} hidden{{end}}>&#129504; {{.CPU}} &middot; {{.Mem}}</span>
   </div>
   <div class="addr-row">
    <button type="button" class="addr" data-copy="{{.Tailnet}}" title="Copy the tailnet address">{{.Tailnet}} &#10697;</button>
@@ -37,6 +38,14 @@
      <button class="btn" data-busy="Cloning&#8230;">Make a copy</button>
     </form></details>
   </div>
+  <div class="sectionhead">Console</div>
+  {{if or (eq .Status "running") (eq .Status "starting")}}
+  <pre id="console-log" class="console" aria-live="polite"></pre>
+  <form id="console-form" class="console-form">
+   <input id="console-cmd" name="cmd" placeholder="say hello" autocomplete="off" aria-label="server command">
+   <button class="btn" type="submit">Send</button>
+  </form>
+  {{else}}<p class="meta">Start the world to use the live console.</p>{{end}}
   <div class="sectionhead">Settings</div>
   <form method="post" action="/settings/{{.Name}}" class="settings-form">
    <input type="hidden" name="back" value="{{.Back}}">
@@ -58,6 +67,19 @@
     <button class="btn" data-busy="&#8230;">Set</button></form></td>
   </tr>{{end}}</table>
   {{else}}<p class="meta">No one has joined yet &mdash; players appear here after their first visit.</p>{{end}}
+  <div class="sectionhead">Backups</div>
+  <form method="post" action="/backup/{{.Name}}"><input type="hidden" name="back" value="{{.Back}}">
+   <button class="btn" data-busy="Backing up&#8230;">Back up now</button></form>
+  <p class="meta">Briefly stops and restarts a running world for a consistent copy.</p>
+  {{if .Backups}}<table class="backups">{{$v := .}}{{range .Backups}}<tr>
+   <td>{{.When}}</td>
+   <td class="meta">{{.Size}}</td>
+   <td><a class="btn" href="/backup/{{$v.Name}}/{{.File}}">Download</a></td>
+   <td><form method="post" action="/backup/{{$v.Name}}/{{.File}}/delete">
+    <input type="hidden" name="back" value="{{$v.Back}}">
+    <button class="btn del" data-busy="&#8230;">Delete</button></form></td>
+  </tr>{{end}}</table>
+  {{else}}<p class="meta">No backups yet.</p>{{end}}
   <div class="sectionhead danger-head">Danger zone</div>
   <details class="dangerbox"><summary>Delete this world&#8230;</summary>
    <form method="post" action="/delete/{{.Name}}">
@@ -76,4 +98,45 @@
  </div>
 </div>
 <p class="meta">Settings and permission changes apply with a ~20s world restart.</p>
+{{end}}
+{{define "scripts"}}
+{{if .CanManage}}
+<script>
+(function () {
+  var name = "{{.Name}}";
+  var log = document.getElementById('console-log');
+  var form = document.getElementById('console-form');
+  if (!log || !form) return;
+
+  var es = new EventSource('/console/' + encodeURIComponent(name));
+  es.onmessage = function (e) {
+    var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    var line = document.createElement('div');
+    line.textContent = e.data;
+    log.appendChild(line);
+    while (log.children.length > 500) log.removeChild(log.firstChild);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  };
+
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var input = document.getElementById('console-cmd');
+    var cmd = input.value.trim();
+    if (!cmd) return;
+    input.disabled = true;
+    try {
+      var res = await fetch('/command/' + encodeURIComponent(name), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'cmd=' + encodeURIComponent(cmd)
+      });
+      if (res.ok) input.value = '';
+    } finally {
+      input.disabled = false;
+      input.focus();
+    }
+  });
+})();
+</script>
+{{end}}
 {{end}}

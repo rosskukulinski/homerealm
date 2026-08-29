@@ -49,7 +49,14 @@ compose file, one small Go binary. No database, no accounts, no cloud.
   visitor from a dropdown
 - **Start / stop / restart** — stopped worlds keep their data, free their
   RAM, and stay stopped across reboots; status badges update live and show
-  *starting* until Bedrock actually accepts players
+  *starting* until Bedrock actually accepts players, alongside a live
+  CPU/RAM chip
+- **Live console** on each world's page: a streaming log tail plus a command
+  box (`docker exec ... send-command` under the hood) to run things like
+  `gamerule` or `say` without shelling into the NAS
+- **On-demand backups**: one click tars up a world's data (stopping/starting
+  it briefly for a consistent copy) into `_backups/<world>/`, downloadable
+  or deletable from the panel; the last `BACKUP_KEEP` are kept
 - **Feels like an app** — dark mode, phone-first layout, tap-to-copy
   addresses, and Add-to-Home-Screen support (the icon is pixel art drawn by
   the binary itself)
