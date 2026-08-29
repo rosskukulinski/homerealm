@@ -15,7 +15,10 @@
 package main
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
@@ -26,8 +29,10 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +49,38 @@ import (
 
 const appVersion = "0.2.0"
 
+// Set via -ldflags -X at build time (see Dockerfile); empty when built
+// plainly (e.g. `go run .`), in which case buildLabel renders nothing.
+var (
+	buildCommit = ""
+	buildBranch = ""
+	buildPR     = ""
+)
+
+// buildLabel renders a small, clickable "what's actually running" marker for
+// the footer — the branch/commit/PR a build came from, distinct from the
+// human-assigned appVersion, which doesn't change on every commit.
+func buildLabel() template.HTML {
+	if buildCommit == "" {
+		return ""
+	}
+	short := buildCommit
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	label := template.HTMLEscapeString(short)
+	if buildBranch != "" && buildBranch != "main" {
+		label = template.HTMLEscapeString(buildBranch) + "@" + label
+	}
+	html := fmt.Sprintf(`<a href="https://github.com/rosskukulinski/homerealm/commit/%s">%s</a>`,
+		template.HTMLEscapeString(buildCommit), label)
+	if buildPR != "" {
+		html += fmt.Sprintf(` (<a href="https://github.com/rosskukulinski/homerealm/pull/%s">PR #%s</a>)`,
+			template.HTMLEscapeString(buildPR), template.HTMLEscapeString(buildPR))
+	}
+	return template.HTML(html)
+}
+
 // ---------- configuration ----------
 var (
 	dataDir  = getenv("DATA_DIR", "/data") // inside this container
@@ -55,9 +92,18 @@ var (
 	panelLAN  = getenvBool("PANEL_LISTEN_LAN", true)
 	basePort  = getenvInt("BASE_PORT", 19132) // first world's LAN UDP port
 
-	tsHostname     = getenv("TS_HOSTNAME", "homerealm") // panel's tailnet name
-	tsAuthKey      = os.Getenv("TS_AUTHKEY")
-	bedrockImage   = getenv("BEDROCK_IMAGE", "itzg/minecraft-bedrock-server:latest")
+	tsHostname   = getenv("TS_HOSTNAME", "homerealm") // panel's tailnet name
+	tsAuthKey    = os.Getenv("TS_AUTHKEY")            // static fallback; prefer the OAuth client below
+	bedrockImage = getenv("BEDROCK_IMAGE", "itzg/minecraft-bedrock-server:latest")
+
+	// Tailscale API OAuth client (auth_keys scope, restricted to tsTag).
+	// When set, the panel mints a fresh single-use, pre-authorized, tagged
+	// auth key for each world sidecar — the admin never handles keys, world
+	// nodes belong to the tag rather than a user, and nothing expires.
+	tsOAuthID      = os.Getenv("TS_OAUTH_CLIENT_ID")
+	tsOAuthSecret  = os.Getenv("TS_OAUTH_CLIENT_SECRET")
+	tsTag          = getenv("TS_TAG", "tag:homerealm")
+	tsAPIBase      = getenv("TS_API_BASE", "https://api.tailscale.com") // a var so tests can point at a fake
 	tailscaleImage = getenv("TAILSCALE_IMAGE", "tailscale/tailscale:latest")
 
 	// Optional LAN auto-discovery (macvlan): each world also gets its own LAN
@@ -68,6 +114,8 @@ var (
 	worldIPPrefix  = getenv("WORLD_IP_PREFIX", "192.168.1.")
 	worldIPFirst   = getenvInt("WORLD_IP_FIRST", 250)
 	worldIPLast    = getenvInt("WORLD_IP_LAST", 254)
+
+	backupKeep = getenvInt("BACKUP_KEEP", 10) // backups retained per world
 )
 
 const project = "homerealm-worlds" // compose project name
@@ -173,20 +221,93 @@ func save(ws []world) {
 // worldStatus reports the container state, refined for running worlds into
 // "starting" until Bedrock has logged readiness — the container is up ~30s
 // before anyone can actually join.
-func worldStatus(name string) string {
+func worldStatus(name string) string { s, _ := worldStatusVersion(name); return s }
+
+// versionRe matches the Bedrock server's startup announcement, e.g.
+// "[... INFO] Version: 1.26.45.01".
+var versionRe = regexp.MustCompile(`Version:? v?(\d+\.\d+\.\d+(?:\.\d+)?)`)
+
+// worldStatusVersion also extracts the running Bedrock version from the same
+// log read the "starting" refinement already does. Version is empty for
+// stopped worlds — they run VERSION: LATEST, so whatever they logged last
+// time may no longer be what the next start downloads.
+func worldStatusVersion(name string) (status, version string) {
 	out, err := exec.Command("docker", "inspect", "-f",
 		"{{.State.Status}}|{{.State.StartedAt}}", "mc-"+name).Output()
 	if err != nil {
-		return "stopped"
+		return "stopped", ""
 	}
 	st, startedAt, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
 	if st == "running" && startedAt != "" {
 		logs, _ := exec.Command("docker", "logs", "--since", startedAt, "mc-"+name).CombinedOutput()
+		if m := versionRe.FindSubmatch(logs); m != nil {
+			version = string(m[1])
+		}
 		if !bytes.Contains(logs, []byte("Server started")) {
-			return "starting"
+			return "starting", version
 		}
 	}
-	return st
+	return st, version
+}
+
+// sidecarWarn reports why a world's tailscale sidecar can't carry traffic
+// ("" = healthy). The game container can show "running" while its shared
+// network namespace is dead — a sidecar that crash-loops or never logged in
+// takes the world's tailnet *and* LAN presence down with it, so surfacing
+// this next to the game status is what makes the panel honest. A var so
+// tests can stub it without docker.
+var sidecarWarn = func(name string) string {
+	out, err := exec.Command("docker", "inspect", "-f",
+		"{{.State.Status}}|{{.RestartCount}}|{{.State.StartedAt}}", "ts-"+name).Output()
+	if err != nil {
+		return "tailnet sidecar missing — press Restart"
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "|")
+	if parts[0] != "running" {
+		return "tailnet sidecar not running — press Restart"
+	}
+	if len(parts) == 3 {
+		if n, _ := strconv.Atoi(parts[1]); n > 3 {
+			if t, err := time.Parse(time.RFC3339Nano, parts[2]); err == nil && time.Since(t) < 2*time.Minute {
+				return "tailnet sidecar is crash-looping — is an auth key configured?"
+			}
+		}
+	}
+	st, err := exec.Command("docker", "exec", "ts-"+name, "tailscale", "status", "--json", "--peers=false").Output()
+	if err != nil {
+		return "tailnet sidecar not responding"
+	}
+	var s struct{ BackendState string }
+	if json.Unmarshal(st, &s) == nil && (s.BackendState == "NeedsLogin" || s.BackendState == "NoState") {
+		return "tailnet sidecar not signed in — world unreachable; press Restart"
+	}
+	return ""
+}
+
+type dockerStat struct {
+	Name     string `json:"Name"`
+	CPUPerc  string `json:"CPUPerc"`
+	MemUsage string `json:"MemUsage"`
+}
+
+// dockerStats snapshots CPU/RAM for every running world in one call (rather
+// than one docker-stats process per world), keyed by world name.
+func dockerStats() map[string]dockerStat {
+	out := map[string]dockerStat{}
+	b, err := exec.Command("docker", "stats", "--no-stream", "--format", "{{json .}}").Output()
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var s dockerStat
+		if line == "" || json.Unmarshal([]byte(line), &s) != nil || !strings.HasPrefix(s.Name, "mc-") {
+			continue
+		}
+		mem, _, _ := strings.Cut(s.MemUsage, " / ") // drop the "/ total" side — it's the host limit, not the world's
+		s.MemUsage = mem
+		out[strings.TrimPrefix(s.Name, "mc-")] = s
+	}
+	return out
 }
 
 // regen rewrites the generated compose file: per world, a tailscale/tailscale
@@ -247,8 +368,13 @@ func regen() {
 	}
 }
 
-func compose(args ...string) {
+func compose(args ...string) { composeEnv(nil, args...) }
+
+func composeEnv(extraEnv []string, args ...string) {
 	cmd := exec.Command("docker", append([]string{"compose", "-p", project, "-f", composeFile}, args...)...)
+	if extraEnv != nil {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		s := string(out)
@@ -259,10 +385,178 @@ func compose(args ...string) {
 	}
 }
 
+// composeUp brings one world's service pair up (explicitly named — a bare
+// `up -d` would also start deliberately-stopped worlds). With an OAuth
+// client configured it mints a fresh auth key for the sidecar; the key
+// travels only through the compose subprocess's environment, never to
+// disk. A changed key recreates the sidecar (compose sees env drift) —
+// harmless for a logged-in sidecar (TS_AUTH_ONCE ignores the new key) and
+// exactly the fix for one that never managed to log in.
+func composeUp(name string) { composeUpArgs(name, false) }
+
+func composeUpArgs(name string, force bool) {
+	var env []string
+	if key, err := mintAuthKey(name); err != nil {
+		log.Printf("mint auth key for %s: %v (falling back to TS_AUTHKEY)", name, err)
+	} else if key != "" {
+		env = []string{"TS_AUTHKEY=" + key}
+	}
+	args := []string{"up", "-d"}
+	if force {
+		args = append(args, "--force-recreate")
+	}
+	composeEnv(env, append(args, "ts-"+name, "mc-"+name)...)
+}
+
 func docker(args ...string) {
 	if err := exec.Command("docker", args...).Run(); err != nil {
 		log.Printf("docker %v: %v", args, err)
 	}
+}
+
+// ---------- bedrock version updates ----------
+
+var bedrockLinksURL = getenv("BEDROCK_LINKS_URL",
+	"https://net-secondary.web.minecraft-services.net/api/v1.0/download/links")
+
+var (
+	bedrockLatestMu  sync.Mutex
+	bedrockLatestVal string
+	bedrockLatestAt  time.Time
+)
+
+var bedrockZipRe = regexp.MustCompile(`bedrock-server-(\d+(?:\.\d+)+)\.zip`)
+
+// latestBedrock returns the newest Bedrock server version Mojang publishes —
+// the same API the server image's downloader consults — cached for an hour
+// (failures too, so an offline NAS doesn't retry every page load). "" means
+// "no update hint available", never an error the UI has to handle.
+func latestBedrock() string {
+	bedrockLatestMu.Lock()
+	defer bedrockLatestMu.Unlock()
+	if time.Since(bedrockLatestAt) < time.Hour {
+		return bedrockLatestVal
+	}
+	bedrockLatestAt, bedrockLatestVal = time.Now(), ""
+	resp, err := httpClient.Get(bedrockLinksURL)
+	if err != nil {
+		log.Printf("bedrock version check: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Result struct {
+			Links []struct {
+				DownloadType string `json:"downloadType"`
+				DownloadURL  string `json:"downloadUrl"`
+			} `json:"links"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		log.Printf("bedrock version check: %v", err)
+		return ""
+	}
+	for _, l := range body.Result.Links {
+		if l.DownloadType == "serverBedrockLinux" {
+			if m := bedrockZipRe.FindStringSubmatch(l.DownloadURL); m != nil {
+				bedrockLatestVal = m[1]
+			}
+		}
+	}
+	return bedrockLatestVal
+}
+
+// verEqual compares versions component-wise over the shorter length with
+// leading zeros stripped, because the same release appears as e.g.
+// "1.26.44.3" in server logs and "1.26.44.03" in download URLs. Erring
+// toward "equal" avoids nagging about updates that aren't real.
+func verEqual(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	n := min(len(pa), len(pb))
+	for i := 0; i < n; i++ {
+		if strings.TrimLeft(pa[i], "0") != strings.TrimLeft(pb[i], "0") {
+			return false
+		}
+	}
+	return true
+}
+
+// updateAvailable returns the newer version a running world could restart
+// into, or "" when it's current (or nothing is known either way).
+func updateAvailable(running string) string {
+	latest := latestBedrock()
+	if running == "" || latest == "" || verEqual(running, latest) {
+		return ""
+	}
+	return latest
+}
+
+// ---------- tailnet auth keys ----------
+
+func canMint() bool { return tsOAuthID != "" && tsOAuthSecret != "" }
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// mintAuthKey creates a single-use, pre-authorized, tagged tailnet auth key
+// via the Tailscale API, so world sidecars join the tailnet without anyone
+// handling keys by hand. Returns "" (no error) when no OAuth client is
+// configured — callers fall back to the static TS_AUTHKEY.
+func mintAuthKey(world string) (string, error) {
+	if !canMint() {
+		return "", nil
+	}
+	tok, err := oauthToken()
+	if err != nil {
+		return "", err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"capabilities": map[string]any{"devices": map[string]any{"create": map[string]any{
+			"reusable": false, "ephemeral": false, "preauthorized": true,
+			"tags": []string{tsTag},
+		}}},
+		"expirySeconds": 600, // only needs to outlive container startup; node identity persists
+		"description":   "homerealm world " + world,
+	})
+	req, err := http.NewRequest("POST", tsAPIBase+"/api/v2/tailnet/-/keys", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", fmt.Errorf("keys API: %s: %s", resp.Status, b)
+	}
+	var out struct{ Key string }
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Key == "" {
+		return "", fmt.Errorf("keys API: no key in response (%v)", err)
+	}
+	return out.Key, nil
+}
+
+func oauthToken() (string, error) {
+	form := url.Values{"client_id": {tsOAuthID}, "client_secret": {tsOAuthSecret}}
+	resp, err := httpClient.PostForm(tsAPIBase+"/api/v2/oauth/token", form)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", fmt.Errorf("oauth token: %s: %s", resp.Status, b)
+	}
+	var out struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.AccessToken == "" {
+		return "", fmt.Errorf("oauth token: bad response (%v)", err)
+	}
+	return out.AccessToken, nil
 }
 
 // alloc picks the next free LAN port and (if discovery) LAN IP.
@@ -397,6 +691,12 @@ type worldView struct {
 	HomeAuto           bool         // discovery: appears under LAN Games
 	Players            []playerView
 	CanManage          bool
+	CPU, Mem           string // live docker-stats snapshot; empty when not running
+	TailscaleIP        string // the world's own tailnet IP; empty until it's joined
+	TailscaleDNS       string // full MagicDNS name (mc-<name>.<tailnet>.ts.net); empty until joined
+	Warn               string // component health: why the world is less alive than Status claims
+	MCVersion          string // Bedrock version from the running server's startup log
+	UpdateTo           string // newer Bedrock version available; empty when current/unknown
 }
 
 type section struct {
@@ -409,6 +709,7 @@ type pageView struct {
 	HasWorlds              bool
 	Presets                []preset
 	DiscoveryNote, Version string
+	Build                  template.HTML
 	Identity, Role         string
 	CanCreate, IsReader    bool
 }
@@ -417,19 +718,57 @@ type pageView struct {
 type worldPageView struct {
 	worldView
 	Modes, Diffs, Perms, Bools []string
-	Version, Identity, Role    string
+	Version                    string
+	Build                      template.HTML
+	Identity, Role             string
 	Back                       string
+	Backups                    []backupView
 }
 
-func buildWorldView(wd world, login string, rl role) worldView {
+func buildWorldView(wd world, login string, rl role, stat dockerStat, peer tsPeer) worldView {
+	status, mcVersion := worldStatusVersion(wd.Name)
+	warn := ""
+	if status == "running" || status == "starting" {
+		warn = sidecarWarn(wd.Name) // only a "running" game can lie about reachability
+	}
 	return worldView{
-		world: wd, Status: worldStatus(wd.Name),
+		world: wd, Status: status,
 		CheatsStr: strconv.FormatBool(wd.Cheats),
 		Tailnet:   "mc-" + wd.Name,
 		ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
 		Strip:     terrain(wd.Name),
 		HomeAuto:  discovery && wd.IP != "",
-		CanManage: canManage(login, rl, &wd)}
+		CanManage: canManage(login, rl, &wd),
+		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
+		TailscaleIP: peer.IP, TailscaleDNS: peer.DNS, Warn: warn,
+		MCVersion: mcVersion, UpdateTo: updateAvailable(mcVersion)}
+}
+
+// tailscaleIPs snapshots each tailnet peer's IP in one Status() call, keyed
+// by hostname (lowercased — that's how each world's ts-<name> sidecar
+// registers, matching the "mc-<name>" hostname set in the generated
+// compose file). Peers not yet joined (e.g. a world that was just created)
+// simply won't have an entry, which callers treat as "IP not known yet".
+type tsPeer struct{ IP, DNS string }
+
+func tailscalePeers(ctx context.Context) map[string]tsPeer {
+	out := map[string]tsPeer{}
+	if localClient == nil {
+		return out
+	}
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return out
+	}
+	for _, p := range st.Peer {
+		if len(p.TailscaleIPs) > 0 {
+			out[strings.ToLower(p.HostName)] = tsPeer{
+				IP:  p.TailscaleIPs[0].String(),
+				DNS: strings.TrimSuffix(p.DNSName, "."),
+			}
+		}
+	}
+	return out
 }
 
 // terrain renders a deterministic strip of "blocks" from the world's name, so
@@ -563,12 +902,14 @@ func index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	view := pageView{Presets: presets, Version: appVersion,
+	view := pageView{Presets: presets, Version: appVersion, Build: buildLabel(),
 		Identity: login, Role: rl.String(),
 		CanCreate: rl >= roleUser, IsReader: rl == roleReader}
+	stats := dockerStats()
+	peers := tailscalePeers(r.Context())
 	var mine, others []worldView
 	for _, wd := range load() {
-		wv := buildWorldView(wd, login, rl)
+		wv := buildWorldView(wd, login, rl, stats[wd.Name], peers["mc-"+wd.Name])
 		if login != "" && strings.EqualFold(wd.Owner, login) {
 			mine = append(mine, wv)
 		} else {
@@ -603,12 +944,12 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	login, rl := requester(r)
-	wv := buildWorldView(*wd, login, rl)
+	wv := buildWorldView(*wd, login, rl, dockerStats()[name], tailscalePeers(r.Context())["mc-"+name])
 	wv.Players = playersOf(name)
 	view := worldPageView{worldView: wv,
 		Modes: modes, Diffs: diffs, Perms: perms, Bools: []string{"false", "true"},
-		Version: appVersion, Identity: login, Role: rl.String(),
-		Back: "/world/" + name}
+		Version: appVersion, Build: buildLabel(), Identity: login, Role: rl.String(),
+		Back: "/world/" + name, Backups: listBackups(name)}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := worldPage.ExecuteTemplate(w, "base.tmpl", view); err != nil {
 		log.Printf("render: %v", err)
@@ -619,12 +960,24 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 func apiWorlds(w http.ResponseWriter, _ *http.Request) {
 	type wireWorld struct {
 		world
-		Status  string `json:"status"`
-		Tailnet string `json:"tailnet"`
+		Status    string `json:"status"`
+		Tailnet   string `json:"tailnet"`
+		CPU       string `json:"cpu,omitempty"`
+		Mem       string `json:"mem,omitempty"`
+		Warn      string `json:"warn,omitempty"`
+		MCVersion string `json:"mc_version,omitempty"`
+		UpdateTo  string `json:"update_to,omitempty"`
 	}
+	stats := dockerStats()
 	out := []wireWorld{}
 	for _, wd := range load() {
-		out = append(out, wireWorld{wd, worldStatus(wd.Name), "mc-" + wd.Name})
+		s := stats[wd.Name]
+		st, mcv := worldStatusVersion(wd.Name)
+		warn := ""
+		if st == "running" || st == "starting" {
+			warn = sidecarWarn(wd.Name)
+		}
+		out = append(out, wireWorld{wd, st, "mc-" + wd.Name, s.CPUPerc, s.MemUsage, warn, mcv, updateAvailable(mcv)})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -710,7 +1063,7 @@ func newWorld(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(filepath.Join(tsStateRoot, name), 0o700)
 	save(append(ws, wd))
 	regen()
-	compose("up", "-d", "mc-"+name)
+	composeUp(name)
 	back(w, r)
 }
 
@@ -736,7 +1089,7 @@ func settings(w http.ResponseWriter, r *http.Request) {
 	wd.ViewDistance = clamp(formInt(r, "view_distance", 10), 5, 32)
 	save(ws)
 	regen()
-	compose("up", "-d", "mc-"+name)
+	composeUp(name)
 	back(w, r)
 }
 
@@ -808,7 +1161,7 @@ func clone(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(filepath.Join(tsStateRoot, newname), 0o700) // fresh tailnet identity
 	save(append(ws, wd))
 	regen()
-	compose("up", "-d", "mc-"+newname)
+	composeUp(newname)
 	back(w, r)
 }
 
@@ -857,7 +1210,17 @@ func ensureSidecar(name string) {
 	}
 	if err := exec.Command("docker", "inspect", "ts-"+name).Run(); err != nil {
 		regen()
-		compose("up", "-d", "mc-"+name)
+		composeUp(name)
+		return
+	}
+	// Self-heal: a sidecar that exists but can't carry traffic (never signed
+	// in, crash-looping) is recreated — with a freshly minted key when an
+	// OAuth client is configured, which is what a stuck login needs. Only
+	// attempted when some key source exists; recreating with no key at all
+	// would just crash-loop again.
+	if sidecarWarn(name) != "" && (canMint() || tsAuthKey != "") {
+		regen()
+		composeUp(name)
 	}
 }
 
@@ -888,6 +1251,257 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	ensureSidecar(name)
 	docker("restart", "mc-"+name)
 	back(w, r)
+}
+
+// updateWorld pulls the latest server image and force-recreates the world's
+// pair — the productized form of "recreate on a fresh image": the recreate
+// picks up both a newer wrapper image and (via VERSION: LATEST) the newest
+// Bedrock, where a plain restart only gets the latter.
+func updateWorld(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	docker("pull", bedrockImage)
+	regen()
+	composeUpArgs(name, true)
+	back(w, r)
+}
+
+// ---------- console ----------
+
+// consoleStream tails the world's container log as Server-Sent Events until
+// the client disconnects (which cancels r.Context(), killing the `docker
+// logs -f` subprocess via CommandContext).
+func consoleStream(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	cmd := exec.CommandContext(r.Context(), "docker", "logs", "-f", "--tail", "200", "mc-"+name)
+	pr, pw := io.Pipe()
+	cmd.Stdout, cmd.Stderr = pw, pw
+	if err := cmd.Start(); err != nil {
+		http.Error(w, "world not running", 502)
+		return
+	}
+	go func() { cmd.Wait(); pw.Close() }()
+
+	w.WriteHeader(200)
+	flusher.Flush()
+	sc := bufio.NewScanner(pr)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		fmt.Fprintf(w, "data: %s\n\n", strings.TrimRight(sc.Text(), "\r"))
+		flusher.Flush()
+	}
+}
+
+// sendCommand runs one console command via the itzg image's bundled
+// send-command script (docker exec, not a shell — no injection risk from
+// the split args). A var so tests can stub it without a live container.
+var sendCommand = func(name string, args []string) error {
+	return exec.Command("docker", append([]string{"exec", "mc-" + name, "send-command"}, args...)...).Run()
+}
+
+func command(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	fields := strings.Fields(r.FormValue("cmd"))
+	if len(fields) == 0 || len(fields) > 50 {
+		http.Error(w, "bad command", 400)
+		return
+	}
+	if err := sendCommand(name, fields); err != nil {
+		http.Error(w, "command failed — is the world running?", 502)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+// ---------- backups ----------
+
+type backupView struct{ File, When, Size string }
+
+// backupWorld makes an on-demand backup. Like Clone, it cold-copies (stop,
+// copy, restart) rather than using Bedrock's save-hold/query/resume protocol
+// — simpler and already trusted elsewhere in this codebase; the tradeoff is
+// a few seconds of downtime for a running world.
+func backupWorld(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	wasRunning := worldStatus(name) == "running"
+	if wasRunning {
+		docker("stop", "mc-"+name)
+	}
+	dir := filepath.Join(dataDir, "_backups", name)
+	os.MkdirAll(dir, 0o775)
+	dest := filepath.Join(dir, time.Now().Format("20060102-150405")+".tar.gz")
+	err := tarGzDir(filepath.Join(dataDir, name), dest)
+	if wasRunning {
+		docker("start", "mc-"+name)
+	}
+	if err != nil {
+		os.Remove(dest)
+		log.Printf("backup %s: %v", name, err)
+		http.Error(w, "backup failed", 500)
+		return
+	}
+	own(dir)
+	pruneBackups(dir, backupKeep)
+	back(w, r)
+}
+
+var backupFileRe = regexp.MustCompile(`^\d{8}-\d{6}\.tar\.gz$`)
+
+func downloadBackup(w http.ResponseWriter, r *http.Request) {
+	name, file := r.PathValue("name"), r.PathValue("file")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	if !backupFileRe.MatchString(file) {
+		http.Error(w, "bad filename", 400)
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+"-"+file+`"`)
+	http.ServeFile(w, r, filepath.Join(dataDir, "_backups", name, file))
+}
+
+func deleteBackup(w http.ResponseWriter, r *http.Request) {
+	name, file := r.PathValue("name"), r.PathValue("file")
+	if authWorld(w, r, load(), name) == nil {
+		return
+	}
+	if !backupFileRe.MatchString(file) {
+		http.Error(w, "bad filename", 400)
+		return
+	}
+	os.Remove(filepath.Join(dataDir, "_backups", name, file))
+	back(w, r)
+}
+
+// listBackups returns a world's backups, newest first, for the detail page.
+func listBackups(name string) []backupView {
+	entries, err := os.ReadDir(filepath.Join(dataDir, "_backups", name))
+	if err != nil {
+		return nil
+	}
+	var out []backupView
+	for _, e := range entries {
+		if e.IsDir() || !backupFileRe.MatchString(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, backupView{File: e.Name(),
+			When: info.ModTime().Format("Jan 2 15:04"), Size: humanSize(info.Size())})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].File > out[j].File })
+	return out
+}
+
+// pruneBackups keeps only the `keep` most recent backups in dir (filenames
+// are timestamps, so lexicographic order is chronological order).
+func pruneBackups(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && backupFileRe.MatchString(e.Name()) {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+	for len(files) > keep {
+		os.Remove(filepath.Join(dir, files[0]))
+		files = files[1:]
+	}
+}
+
+func humanSize(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(1024), 0
+	for m := n / 1024; m >= 1024; m /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// tarGzDir writes a gzip-compressed tarball of srcDir's contents to
+// destFile. Close errors (e.g. a full disk truncating the write) are
+// surfaced rather than swallowed, since a "successful" backup that's
+// actually corrupt would be worse than an obvious failure.
+func tarGzDir(srcDir, destFile string) (err error) {
+	f, err := os.Create(destFile)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	walkErr := filepath.Walk(srcDir, func(path string, info os.FileInfo, ferr error) error {
+		if ferr != nil {
+			return ferr
+		}
+		rel, relErr := filepath.Rel(srcDir, path)
+		if relErr != nil || rel == "." {
+			return relErr
+		}
+		hdr, hErr := tar.FileInfoHeader(info, "")
+		if hErr != nil {
+			return hErr
+		}
+		hdr.Name = rel
+		if info.IsDir() {
+			hdr.Name += "/"
+		}
+		if wErr := tw.WriteHeader(hdr); wErr != nil {
+			return wErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		file, oErr := os.Open(path)
+		if oErr != nil {
+			return oErr
+		}
+		defer file.Close()
+		_, cErr := io.Copy(tw, file)
+		return cErr
+	})
+	if walkErr != nil {
+		tw.Close()
+		gz.Close()
+		return walkErr
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gz.Close()
 }
 
 // ---------- helpers ----------
@@ -1035,6 +1649,12 @@ func routes() *http.ServeMux {
 	mux.HandleFunc("POST /start/{name}", start)
 	mux.HandleFunc("POST /stop/{name}", stop)
 	mux.HandleFunc("POST /restart/{name}", restart)
+	mux.HandleFunc("POST /update/{name}", updateWorld)
+	mux.HandleFunc("GET /console/{name}", consoleStream)
+	mux.HandleFunc("POST /command/{name}", command)
+	mux.HandleFunc("POST /backup/{name}", backupWorld)
+	mux.HandleFunc("GET /backup/{name}/{file}", downloadBackup)
+	mux.HandleFunc("POST /backup/{name}/{file}/delete", deleteBackup)
 	return mux
 }
 

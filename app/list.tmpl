@@ -20,10 +20,13 @@ Tailscale &mdash; open the panel from a Tailscale device to create or manage wor
    <span class="chip">{{.ModeIcon}} {{.Mode}}</span>
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
    {{if and .Owner .CanManage}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
+   <span class="chip" data-mcver="{{.Name}}" title="Minecraft Bedrock version &#8212; player devices need the matching app version to join"{{if not .MCVersion}} hidden{{end}}>&#9935; {{.MCVersion}}{{if .UpdateTo}} &#8594; {{.UpdateTo}}{{end}}</span>
+   <span class="chip warn" data-warn="{{.Name}}"{{if not .Warn}} hidden{{end}}>&#9888; {{.Warn}}</span>
+   <span class="chip resource" data-resource="{{.Name}}"{{if or (ne .Status "running") (not .CPU)}} hidden{{end}}>&#129504; {{.CPU}} &middot; {{.Mem}}</span>
   </div>
   <div class="addr-row">
-   <button type="button" class="addr" data-copy="{{.Tailnet}}" title="Copy the tailnet address">{{.Tailnet}} &#10697;</button>
-   <span>port <b>19132</b> via Tailscale</span>
+   {{if .TailscaleIP}}<button type="button" class="addr" data-copy="{{.TailscaleIP}}" title="Copy the Tailscale IP &#8212; more reliable than the hostname in the Minecraft app">{{.TailscaleIP}} &#10697;</button>
+   <span>port <b>19132</b> via Tailscale</span>{{end}}
    {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{else}}<span>&middot; LAN &lt;host&gt;:{{.Port}}</span>{{end}}
   </div>
   <div class="actions">
