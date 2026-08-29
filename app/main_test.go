@@ -326,7 +326,7 @@ func TestWorldDetailLANAddress(t *testing.T) {
 	if ws[0].IP == "" {
 		t.Fatal("expected an allocated macvlan IP")
 	}
-	if !strings.Contains(body, `data-copy="`+ws[0].IP+`:19132"`) {
+	if !strings.Contains(body, `data-copy="`+ws[0].IP+`"`) {
 		t.Fatalf("expected a copyable real LAN address for %s, got:\n%s", ws[0].IP, body)
 	}
 }
