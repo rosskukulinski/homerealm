@@ -9,6 +9,8 @@ services:
     env_file: .env
     environment:
       DATA_DIR: /data
+    # LAN access to the panel (PANEL_LISTEN_LAN); on the tailnet it serves
+    # http(s)://<TS_HOSTNAME> directly — no port mapping involved.
     ports:
       - "${PANEL_PORT:-8090}:${PANEL_PORT:-8090}"
     volumes:
