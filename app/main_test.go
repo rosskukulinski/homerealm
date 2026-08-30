@@ -184,6 +184,58 @@ func TestListPageFilterThreshold(t *testing.T) {
 	}
 }
 
+func TestGamerulesMapping(t *testing.T) {
+	// All off = the explicit vanilla values, so unchecking a box reverts.
+	got := gamerules(world{})
+	want := [][2]string{
+		{"playersleepingpercentage", "100"},
+		{"keepinventory", "false"},
+		{"mobgriefing", "true"},
+		{"showcoordinates", "false"},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("vanilla gamerules[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+	got = gamerules(world{OneSleep: true, KeepInv: true, NoMobGrief: true, ShowCoords: true})
+	want = [][2]string{
+		{"playersleepingpercentage", "1"},
+		{"keepinventory", "true"},
+		{"mobgriefing", "false"},
+		{"showcoordinates", "true"},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("all-on gamerules[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTogglesPersist(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/new", url.Values{"name": {"famworld"},
+		"one_sleep": {"on"}, "no_mob_grief": {"on"}}); c != 302 {
+		t.Fatalf("create = %d", c)
+	}
+	wd := findWorld(load(), "famworld")
+	if wd == nil || !wd.OneSleep || wd.KeepInv || !wd.NoMobGrief || wd.ShowCoords {
+		t.Fatalf("toggles after create: %+v", wd)
+	}
+
+	// Settings without the boxes checked reverts them all to vanilla.
+	if c := post(mux, "/settings/famworld", url.Values{"mode": {"survival"},
+		"difficulty": {"easy"}, "default_permission": {"member"},
+		"keep_inventory": {"on"}}); c != 302 {
+		t.Fatalf("settings = %d", c)
+	}
+	wd = findWorld(load(), "famworld")
+	if wd == nil || wd.OneSleep || !wd.KeepInv || wd.NoMobGrief || wd.ShowCoords {
+		t.Fatalf("toggles after settings: %+v", wd)
+	}
+}
+
 func TestSortWorlds(t *testing.T) {
 	ws := []worldView{
 		{world: world{Name: "zeta"}, Status: "stopped"},
