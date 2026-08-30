@@ -182,15 +182,41 @@ Tailscale identity (WhoIs) decides what each request may do:
 Every rule is enforced server-side on each request, not just hidden in the
 UI; the footer shows who you are and your role. With `PANEL_ADMINS` empty,
 every tailnet user is an admin (the pre-0.2 behavior) — set it to activate
-the tiers. Worlds created before v0.2 have no owner and are admin-only to
-manage (add an `"owner"` in `worlds.json` to hand one over). You can still
-layer [Tailscale ACLs](https://tailscale.com/kb/1018/acls) underneath to
-keep chosen devices away from the panel or from world ports entirely.
+the tiers (the panel logs a warning on startup while it's empty). Worlds
+created before v0.2 have no owner and are admin-only to manage (add an
+`"owner"` in `worlds.json` to hand one over). You can still layer
+[Tailscale ACLs](https://tailscale.com/kb/1018/acls) underneath to keep
+chosen devices away from the panel or from world ports entirely.
+
+State-changing requests are also **CSRF-guarded**: because authorization is
+ambient (derived from your tailnet source IP, with no token or cookie), the
+panel rejects cross-site POSTs so a random web page you visit can't act as
+you against it. Non-browser clients (the CLI, `curl`) are unaffected.
 
 `PANEL_LISTEN_LAN=true` additionally exposes plain HTTP on your LAN; since
-LAN requests carry no Tailscale identity they are read-only. Set it `false`
-for tailnet-only. **Never port-forward the panel.** (The archive-on-delete
-design limits the blast radius of curious children.)
+LAN requests carry no Tailscale identity they are read-only. That view is
+also **minimized**: anonymous LAN/reader callers (panel and `/api/worlds`
+alike) see world names, status, game type and address, but not owner
+identities or live CPU/RAM/health detail — those are for signed-in tailnet
+users. Set it `false` for tailnet-only. **Never port-forward the panel.**
+(The archive-on-delete design limits the blast radius of curious children.)
+
+### Docker access is brokered, not raw
+
+The panel manages containers, but it does **not** bind-mount
+`/var/run/docker.sock`. Instead `docker-compose.yml` runs a
+[docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy)
+sidecar that mounts the socket read-only and whitelists only the Docker API
+sections homerealm uses (containers, images, networks, exec, and the
+start/stop/restart grants); Swarm, Secrets, registry Auth and Build stay
+blocked. The panel reaches it over a private `internal` compose network at
+`tcp://docker-socket-proxy:2375`, never the host.
+
+This shrinks the blast radius and removes the socket from the panel's
+filesystem, but note it isn't a full containment boundary: creating and
+starting containers is homerealm's whole job, so a complete compromise of
+the panel could still craft a container that escapes. Keep the panel image
+and the proxy version current.
 
 ## CLI
 
@@ -211,7 +237,7 @@ LAN requests are read-only.
 - **Panel shows no buttons / actions return 403** — you're read-only. Either
   you're on the LAN listener (open the panel via its tailnet address
   instead), or the world belongs to someone else — the footer shows who you
-  are and your role, each world card shows its owner.
+  are and your role, and signed-in users see each world's owner on its card.
 - **World never appears on the tailnet** — check `docker logs ts-<name>`;
   an expired/single-use `TS_AUTHKEY` is the usual cause. Put a fresh
   reusable key in `.env` and restart the sidecar.
