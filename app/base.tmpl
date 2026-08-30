@@ -150,6 +150,14 @@ table.backups form { display:inline; }
   color:var(--grass-dk); box-shadow:0 2px 0 var(--grass-dk); font-weight:700; }
 .newrow { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin:.5rem 0; }
 footer { margin-top:2.2rem; }
+
+/* new-world dialog + filter */
+.headright { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+dialog.newdlg { border:1px solid var(--line); border-radius:14px; padding:0;
+  background:var(--card); color:var(--ink); width:min(92vw, 560px); margin:auto; }
+dialog.newdlg::backdrop { background:rgba(20,20,10,.5); }
+dialog.newdlg .newbox { margin-top:0; border:none; box-shadow:none; }
+#worldfilter { display:block; width:100%; margin:.8rem 0 .2rem; }
 </style></head><body>
 {{template "content" .}}
 <footer class="meta">homerealm v{{.Version}}{{if .Build}} &middot; {{.Build}}{{end}} &middot; {{if .Identity}}{{.Identity}} ({{.Role}}){{else}}{{.Role}}{{end}} &middot;

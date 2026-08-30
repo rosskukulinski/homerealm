@@ -717,6 +717,7 @@ type pageView struct {
 	Build                  template.HTML
 	Identity, Role         string
 	CanCreate, IsReader    bool
+	ShowFilter             bool // enough worlds that a name filter earns its place
 }
 
 // worldPageView backs the per-world detail page (/world/<name>).
@@ -909,6 +910,24 @@ func playersOf(name string) []playerView {
 	return out
 }
 
+// sortWorlds orders live worlds above stopped ones (what a big list is
+// scanned for), alphabetical within each group; stable so equal worlds keep
+// their creation order.
+func sortWorlds(ws []worldView) {
+	weight := func(s string) int {
+		if s == "running" || s == "starting" {
+			return 0
+		}
+		return 1
+	}
+	sort.SliceStable(ws, func(i, j int) bool {
+		if wi, wj := weight(ws[i].Status), weight(ws[j].Status); wi != wj {
+			return wi < wj
+		}
+		return ws[i].Name < ws[j].Name
+	})
+}
+
 func index(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -929,7 +948,10 @@ func index(w http.ResponseWriter, r *http.Request) {
 			others = append(others, wv)
 		}
 	}
+	sortWorlds(mine)
+	sortWorlds(others)
 	view.HasWorlds = len(mine)+len(others) > 0
+	view.ShowFilter = len(mine)+len(others) >= 7
 	if len(mine) > 0 && len(others) > 0 {
 		view.Sections = []section{{"Your worlds", mine}, {"Everyone else’s", others}}
 	} else if view.HasWorlds {

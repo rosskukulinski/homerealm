@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -141,6 +142,62 @@ func TestParseAdmins(t *testing.T) {
 	}
 	if len(parseAdmins("")) != 0 {
 		t.Fatal("empty PANEL_ADMINS must parse to no admins")
+	}
+}
+
+func TestListPageNewWorldDialog(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{`id="newbtn"`, `id="newdlg"`, `id="newcancel"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("user list page missing %q", want)
+		}
+	}
+
+	as("", roleReader)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if strings.Contains(rec.Body.String(), `id="newbtn"`) {
+		t.Fatal("reader must not see the new-world button")
+	}
+}
+
+func TestListPageFilterThreshold(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	for i := 0; i < 6; i++ {
+		post(mux, "/new", url.Values{"name": {fmt.Sprintf("w%d", i)}})
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if strings.Contains(rec.Body.String(), `id="worldfilter"`) {
+		t.Fatal("filter should not appear with only 6 worlds")
+	}
+	post(mux, "/new", url.Values{"name": {"w6"}})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(rec.Body.String(), `id="worldfilter"`) {
+		t.Fatal("filter should appear at 7 worlds")
+	}
+}
+
+func TestSortWorlds(t *testing.T) {
+	ws := []worldView{
+		{world: world{Name: "zeta"}, Status: "stopped"},
+		{world: world{Name: "mid"}, Status: "running"},
+		{world: world{Name: "alpha"}, Status: "exited"},
+		{world: world{Name: "boot"}, Status: "starting"},
+	}
+	sortWorlds(ws)
+	got := []string{ws[0].Name, ws[1].Name, ws[2].Name, ws[3].Name}
+	want := []string{"boot", "mid", "alpha", "zeta"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sort order = %v, want %v", got, want)
+		}
 	}
 }
 
