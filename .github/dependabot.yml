@@ -1,0 +1,36 @@
+# Dependabot opens PRs when updates (including security fixes) are available,
+# so pinned versions don't silently go stale. Paired with the govulncheck step
+# in CI (which fails the build on a reachable Go CVE) and GitHub's Dependabot
+# security alerts, this is how we hear about patches worth taking.
+version: 2
+updates:
+  # Go modules (the app lives in /app)
+  - package-ecosystem: gomod
+    directory: /app
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns: ["*"]
+
+  # GitHub Actions in the workflows — pinned to commit SHAs; Dependabot bumps
+  # the SHA and the trailing "# vX" comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Build + runtime base images in app/Dockerfile (golang, alpine).
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: weekly
+
+  # The docker-socket-proxy image pinned by digest in docker-compose.yml.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
