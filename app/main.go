@@ -47,7 +47,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const appVersion = "0.2.0"
+const appVersion = "0.3.0"
 
 // Set via -ldflags -X at build time (see Dockerfile); empty when built
 // plainly (e.g. `go run .`), in which case buildLabel renders nothing.
