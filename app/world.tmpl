@@ -15,7 +15,7 @@
   <div class="chips">
    <span class="chip">{{.ModeIcon}} {{.Mode}}</span>
    <span class="chip">{{.DiffIcon}} {{.Difficulty}}</span>
-   {{if .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
+   {{if and .Identified .Owner}}<span class="chip">&#128100; {{.Owner}}</span>{{end}}
    {{if .HomeAuto}}<span class="chip">&#127968; LAN Games at home</span>{{end}}
    <span class="chip" data-mcver="{{.Name}}" title="Minecraft Bedrock version &#8212; player devices need the matching app version to join"{{if not .MCVersion}} hidden{{end}}>&#9935; {{.MCVersion}}{{if .UpdateTo}} &#8594; {{.UpdateTo}}{{end}}</span>
    <span class="chip warn" data-warn="{{.Name}}"{{if not .Warn}} hidden{{end}}>&#9888; {{.Warn}}</span>

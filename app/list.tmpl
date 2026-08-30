@@ -14,7 +14,7 @@ Tailscale &mdash; open the panel from a Tailscale device to create or manage wor
   <div class="cardhead">
    <a class="wlink" href="/world/{{.Name}}"><span class="wname">{{.Name}}</span></a>
    <span class="badge st-{{.Status}}" data-status="{{.Name}}"><i></i>{{.Status}}</span>
-   {{if not .CanManage}}<span class="chip" title="only its owner or an admin can manage this world">&#128274; {{if .Owner}}{{.Owner}}{{else}}admins only{{end}}</span>{{end}}
+   {{if not .CanManage}}<span class="chip" title="only its owner or an admin can manage this world">&#128274; {{if and .Identified .Owner}}{{.Owner}}{{else if .Owner}}view only{{else}}admins only{{end}}</span>{{end}}
   </div>
   <div class="chips">
    <span class="chip">{{.ModeIcon}} {{.Mode}}</span>

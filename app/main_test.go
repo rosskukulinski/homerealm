@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func setupTest(t *testing.T) *http.ServeMux {
+func setupTest(t *testing.T) http.Handler {
 	t.Helper()
 	dir := t.TempDir()
 	dataDir = dir
@@ -31,7 +31,7 @@ func as(login string, rl role) {
 	requester = func(*http.Request) (string, role) { return login, rl }
 }
 
-func post(mux *http.ServeMux, path string, form url.Values) int {
+func post(mux http.Handler, path string, form url.Values) int {
 	req := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func post(mux *http.ServeMux, path string, form url.Values) int {
 	return rec.Code
 }
 
-func get(mux *http.ServeMux, path string) int {
+func get(mux http.Handler, path string) int {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
 	return rec.Code
@@ -470,5 +470,80 @@ func TestBackRedirectValidation(t *testing.T) {
 		if loc := rec.Header().Get("Location"); loc != "/" {
 			t.Fatalf("back=%q redirected to %q, want /", bad, loc)
 		}
+	}
+}
+
+func TestCSRF(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	if c := post(mux, "/new", url.Values{"name": {"csrfworld"}}); c != 302 {
+		t.Fatalf("same-origin create = %d, want 302", c)
+	}
+
+	// A browser tags a request forged from another site as cross-site; even
+	// though the owner's identity is in scope, it must be rejected before it
+	// can act — otherwise ambient Tailscale auth makes the browser a deputy.
+	post := func(setHdr func(*http.Request)) int {
+		req := httptest.NewRequest("POST", "/delete/csrfworld", nil)
+		setHdr(req)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := post(func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "cross-site") }); c != 403 {
+		t.Fatalf("cross-site POST = %d, want 403", c)
+	}
+	if c := post(func(r *http.Request) { r.Header.Set("Origin", "https://evil.example") }); c != 403 {
+		t.Fatalf("cross-origin POST = %d, want 403", c)
+	}
+	if findWorld(load(), "csrfworld") == nil {
+		t.Fatal("a blocked cross-site request must not have deleted the world")
+	}
+
+	// Same-origin requests (from the panel's own pages/JS) still go through,
+	// whether tagged by Sec-Fetch-Site or by a matching Origin.
+	if c := post(func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "same-origin") }); c != 302 {
+		t.Fatalf("same-origin POST = %d, want 302", c)
+	}
+	as("kid@example.com", roleUser)
+	if c := post(func(r *http.Request) { r.Header.Set("Origin", "http://example.com") }); c != 404 {
+		// world already deleted above; 404 (not 403) proves CSRF let it through
+		t.Fatalf("matching-Origin POST = %d, want 404 (passed CSRF, world gone)", c)
+	}
+}
+
+func TestAPIWorldsFieldGating(t *testing.T) {
+	mux := setupTest(t)
+	as("kid@example.com", roleUser)
+	post(mux, "/new", url.Values{"name": {"apiworld"}, "seed": {"sup3rseed"}})
+
+	body := func() string {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/worlds", nil))
+		return rec.Body.String()
+	}
+
+	// Anonymous reader (LAN visitor): no owner identity, no seed, no live ops.
+	as("", roleReader)
+	anon := body()
+	for _, leak := range []string{`"owner"`, `"seed"`, `"cpu"`, `"mem"`, `"warn"`, "kid@example.com", "sup3rseed"} {
+		if strings.Contains(anon, leak) {
+			t.Fatalf("reader /api/worlds leaked %q:\n%s", leak, anon)
+		}
+	}
+	for _, want := range []string{`"name":"apiworld"`, `"status"`, `"mode"`, `"port"`} {
+		if !strings.Contains(anon, want) {
+			t.Fatalf("reader /api/worlds missing %q:\n%s", want, anon)
+		}
+	}
+
+	// Signed-in tailnet user: owner is surfaced; the seed still never is.
+	as("kid@example.com", roleUser)
+	authed := body()
+	if !strings.Contains(authed, `"owner":"kid@example.com"`) {
+		t.Fatalf("signed-in /api/worlds missing owner:\n%s", authed)
+	}
+	if strings.Contains(authed, `"seed"`) || strings.Contains(authed, "sup3rseed") {
+		t.Fatalf("seed must never be exposed via the API:\n%s", authed)
 	}
 }
