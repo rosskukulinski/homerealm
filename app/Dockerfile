@@ -1,7 +1,7 @@
 # The build stage runs on the BUILD host's architecture and Go
 # cross-compiles for the target — multi-arch images without emulating the
 # compiler under QEMU, which is ~4x faster for the arm64 half.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       -X main.buildPR=${BUILD_PR}" \
     -o /homerealm .
 
-FROM alpine:3.20
+FROM alpine:3.22
 RUN apk add --no-cache docker-cli docker-cli-compose ca-certificates
 COPY --from=build /homerealm /usr/local/bin/homerealm
 EXPOSE 8090
