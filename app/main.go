@@ -333,7 +333,11 @@ func regen() {
 		}
 		var envs []string
 		for _, kv := range env {
-			envs = append(envs, fmt.Sprintf("%s: %q", kv[0], fmt.Sprint(kv[1])))
+			// Escape $ as $$ so docker-compose won't interpolate a ${VAR} out
+			// of any value (e.g. a world seed a user typed) when it reads this
+			// generated file.
+			val := strings.ReplaceAll(fmt.Sprint(kv[1]), "$", "$$")
+			envs = append(envs, fmt.Sprintf("%s: %q", kv[0], val))
 		}
 		net := ""
 		if discovery && w.IP != "" {
@@ -697,6 +701,7 @@ type worldView struct {
 	Warn               string // component health: why the world is less alive than Status claims
 	MCVersion          string // Bedrock version from the running server's startup log
 	UpdateTo           string // newer Bedrock version available; empty when current/unknown
+	Identified         bool   // viewer is a signed-in tailnet user (not an anonymous LAN/reader)
 }
 
 type section struct {
@@ -727,19 +732,27 @@ type worldPageView struct {
 
 func buildWorldView(wd world, login string, rl role, stat dockerStat, peer tsPeer) worldView {
 	status, mcVersion := worldStatusVersion(wd.Name)
-	warn := ""
-	if status == "running" || status == "starting" {
-		warn = sidecarWarn(wd.Name) // only a "running" game can lie about reachability
+	identified := rl >= roleUser
+	// Operational detail (CPU/RAM, sidecar health) is shown to signed-in
+	// tailnet users only — anonymous LAN/reader viewers don't get it, and
+	// neither does the JSON API for them (see apiWorlds).
+	warn, cpu, mem := "", "", ""
+	if identified {
+		cpu, mem = stat.CPUPerc, stat.MemUsage
+		if status == "running" || status == "starting" {
+			warn = sidecarWarn(wd.Name) // only a "running" game can lie about reachability
+		}
 	}
 	return worldView{
 		world: wd, Status: status,
 		CheatsStr: strconv.FormatBool(wd.Cheats),
 		Tailnet:   "mc-" + wd.Name,
 		ModeIcon:  modeIcon(wd.Mode), DiffIcon: diffIcon(wd.Difficulty),
-		Strip:     terrain(wd.Name),
-		HomeAuto:  discovery && wd.IP != "",
-		CanManage: canManage(login, rl, &wd),
-		CPU:       stat.CPUPerc, Mem: stat.MemUsage,
+		Strip:      terrain(wd.Name),
+		HomeAuto:   discovery && wd.IP != "",
+		CanManage:  canManage(login, rl, &wd),
+		Identified: identified,
+		CPU:        cpu, Mem: mem,
 		TailscaleIP: peer.IP, TailscaleDNS: peer.DNS, Warn: warn,
 		MCVersion: mcVersion, UpdateTo: updateAvailable(mcVersion)}
 }
@@ -957,27 +970,52 @@ func worldDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- JSON API (used by the CLI) ----------
-func apiWorlds(w http.ResponseWriter, _ *http.Request) {
+//
+// This endpoint is unauthenticated and served on the plain-HTTP LAN listener
+// as well as the tailnet, so it deliberately projects an explicit, minimal
+// set of fields rather than embedding the whole world struct. Low-sensitivity
+// fields the CLI list and the status poll need (name/status/port/mode/…) go to
+// everyone; owner identity and live operational detail (CPU/RAM, sidecar
+// health) are added only for signed-in tailnet users. The world seed is never
+// exposed here at all.
+func apiWorlds(w http.ResponseWriter, r *http.Request) {
 	type wireWorld struct {
-		world
-		Status    string `json:"status"`
-		Tailnet   string `json:"tailnet"`
-		CPU       string `json:"cpu,omitempty"`
-		Mem       string `json:"mem,omitempty"`
-		Warn      string `json:"warn,omitempty"`
-		MCVersion string `json:"mc_version,omitempty"`
-		UpdateTo  string `json:"update_to,omitempty"`
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Tailnet    string `json:"tailnet"`
+		Port       int    `json:"port"`
+		Mode       string `json:"mode"`
+		Difficulty string `json:"difficulty"`
+		MCVersion  string `json:"mc_version,omitempty"`
+		UpdateTo   string `json:"update_to,omitempty"`
+		// Signed-in tailnet users only:
+		Owner string `json:"owner,omitempty"`
+		CPU   string `json:"cpu,omitempty"`
+		Mem   string `json:"mem,omitempty"`
+		Warn  string `json:"warn,omitempty"`
 	}
-	stats := dockerStats()
+	_, rl := requester(r)
+	identified := rl >= roleUser
+	var stats map[string]dockerStat
+	if identified {
+		stats = dockerStats() // skip the docker-stats call for anonymous pollers
+	}
 	out := []wireWorld{}
 	for _, wd := range load() {
-		s := stats[wd.Name]
 		st, mcv := worldStatusVersion(wd.Name)
-		warn := ""
-		if st == "running" || st == "starting" {
-			warn = sidecarWarn(wd.Name)
+		ww := wireWorld{
+			Name: wd.Name, Status: st, Tailnet: "mc-" + wd.Name,
+			Port: wd.Port, Mode: wd.Mode, Difficulty: wd.Difficulty,
+			MCVersion: mcv, UpdateTo: updateAvailable(mcv),
 		}
-		out = append(out, wireWorld{wd, st, "mc-" + wd.Name, s.CPUPerc, s.MemUsage, warn, mcv, updateAvailable(mcv)})
+		if identified {
+			s := stats[wd.Name]
+			ww.Owner, ww.CPU, ww.Mem = wd.Owner, s.CPUPerc, s.MemUsage
+			if st == "running" || st == "starting" {
+				ww.Warn = sidecarWarn(wd.Name)
+			}
+		}
+		out = append(out, ww)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -1631,7 +1669,49 @@ func manifest(w http.ResponseWriter, _ *http.Request) {
 }
 
 // ---------- main ----------
-func routes() *http.ServeMux {
+
+// csrfSafe guards against cross-site request forgery. Because the panel
+// authorizes by ambient Tailscale identity (the request's source IP), the
+// browser is a confused deputy: without this check, any web page a tailnet
+// user visits could auto-submit a form — or a simple cross-origin fetch — to
+// the panel and act with the victim's privileges. Browsers always send
+// Sec-Fetch-Site, and cross-origin requests also carry Origin; the CLI and
+// curl send neither, so non-browser clients are unaffected.
+func csrfSafe(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "cross-site", "same-site":
+		return false
+	}
+	// No Sec-Fetch-Site (older or non-browser client): if an Origin is present
+	// it must match the request host; otherwise allow it (e.g. curl, the CLI).
+	if o := r.Header.Get("Origin"); o != "" {
+		u, err := url.Parse(o)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return false
+		}
+	}
+	return true
+}
+
+// guardCSRF rejects state-changing cross-site requests before they reach a
+// handler. Safe methods (GET/HEAD/OPTIONS) pass through untouched.
+func guardCSRF(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if !csrfSafe(r) {
+				http.Error(w, "cross-site request blocked", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", index)
 	mux.HandleFunc("GET /world/{name}", worldDetail)
@@ -1655,11 +1735,14 @@ func routes() *http.ServeMux {
 	mux.HandleFunc("POST /backup/{name}", backupWorld)
 	mux.HandleFunc("GET /backup/{name}/{file}", downloadBackup)
 	mux.HandleFunc("POST /backup/{name}/{file}/delete", deleteBackup)
-	return mux
+	return guardCSRF(mux)
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+	if len(admins) == 0 {
+		log.Printf("WARNING: PANEL_ADMINS is empty — every tailnet user is a full admin. Set PANEL_ADMINS to restrict who can manage worlds.")
+	}
 	for _, d := range []string{dataDir, tsStateRoot, filepath.Join(tsStateRoot, "panel")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Fatalf("mkdir %s: %v", d, err)
