@@ -42,3 +42,5 @@ jobs:
             BUILD_COMMIT=${{ github.sha }}
             BUILD_BRANCH=${{ github.head_ref }}
             BUILD_PR=${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
