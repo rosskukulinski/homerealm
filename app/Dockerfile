@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       -X main.buildPR=${BUILD_PR}" \
     -o /homerealm .
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache docker-cli docker-cli-compose ca-certificates
 COPY --from=build /homerealm /usr/local/bin/homerealm
 EXPOSE 8090
