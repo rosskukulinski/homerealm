@@ -188,6 +188,15 @@ type world struct {
 	Seed              string `json:"seed"`
 	LevelType         string `json:"level_type"`
 	DefaultPermission string `json:"default_permission"`
+
+	// Family-friendly world toggles, applied as gamerules once the server is
+	// up (they live in the world save, not server.properties). false = the
+	// vanilla behavior, so worlds from before these fields existed change
+	// nothing.
+	OneSleep   bool `json:"one_sleep,omitempty"`        // one player sleeping skips the night
+	KeepInv    bool `json:"keep_inventory,omitempty"`   // no item scatter on death
+	NoMobGrief bool `json:"no_mob_grief,omitempty"`     // creepers etc. can't break builds
+	ShowCoords bool `json:"show_coordinates,omitempty"` // coordinates on screen
 }
 
 func defaultWorld(name string, port int, ip, mode string) world {
@@ -717,6 +726,7 @@ type pageView struct {
 	Build                  template.HTML
 	Identity, Role         string
 	CanCreate, IsReader    bool
+	ShowFilter             bool // enough worlds that a name filter earns its place
 }
 
 // worldPageView backs the per-world detail page (/world/<name>).
@@ -909,6 +919,24 @@ func playersOf(name string) []playerView {
 	return out
 }
 
+// sortWorlds orders live worlds above stopped ones (what a big list is
+// scanned for), alphabetical within each group; stable so equal worlds keep
+// their creation order.
+func sortWorlds(ws []worldView) {
+	weight := func(s string) int {
+		if s == "running" || s == "starting" {
+			return 0
+		}
+		return 1
+	}
+	sort.SliceStable(ws, func(i, j int) bool {
+		if wi, wj := weight(ws[i].Status), weight(ws[j].Status); wi != wj {
+			return wi < wj
+		}
+		return ws[i].Name < ws[j].Name
+	})
+}
+
 func index(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -929,7 +957,10 @@ func index(w http.ResponseWriter, r *http.Request) {
 			others = append(others, wv)
 		}
 	}
+	sortWorlds(mine)
+	sortWorlds(others)
 	view.HasWorlds = len(mine)+len(others) > 0
+	view.ShowFilter = len(mine)+len(others) >= 7
 	if len(mine) > 0 && len(others) > 0 {
 		view.Sections = []section{{"Your worlds", mine}, {"Everyone else’s", others}}
 	} else if view.HasWorlds {
@@ -1090,6 +1121,7 @@ func newWorld(w http.ResponseWriter, r *http.Request) {
 	if r.FormValue("flat") != "" {
 		wd.LevelType = "FLAT"
 	}
+	setToggles(&wd, r)
 	if pre != nil {
 		wd.Difficulty, wd.Cheats = pre.Difficulty, pre.Cheats
 	} else if mode == "creative" {
@@ -1102,7 +1134,17 @@ func newWorld(w http.ResponseWriter, r *http.Request) {
 	save(append(ws, wd))
 	regen()
 	composeUp(name)
+	applyGamerules(name)
 	back(w, r)
+}
+
+// setToggles reads the family-toggle checkboxes (absent = unchecked = the
+// vanilla behavior; both forms that post here always include them).
+func setToggles(wd *world, r *http.Request) {
+	wd.OneSleep = r.FormValue("one_sleep") != ""
+	wd.KeepInv = r.FormValue("keep_inventory") != ""
+	wd.NoMobGrief = r.FormValue("no_mob_grief") != ""
+	wd.ShowCoords = r.FormValue("show_coordinates") != ""
 }
 
 func settings(w http.ResponseWriter, r *http.Request) {
@@ -1125,9 +1167,11 @@ func settings(w http.ResponseWriter, r *http.Request) {
 	wd.Cheats = r.FormValue("cheats") == "true"
 	wd.MaxPlayers = clamp(formInt(r, "max_players", 10), 1, 30)
 	wd.ViewDistance = clamp(formInt(r, "view_distance", 10), 5, 32)
+	setToggles(wd, r)
 	save(ws)
 	regen()
 	composeUp(name)
+	applyGamerules(name)
 	back(w, r)
 }
 
@@ -1200,6 +1244,7 @@ func clone(w http.ResponseWriter, r *http.Request) {
 	save(append(ws, wd))
 	regen()
 	composeUp(newname)
+	applyGamerules(newname)
 	back(w, r)
 }
 
@@ -1269,6 +1314,7 @@ func start(w http.ResponseWriter, r *http.Request) {
 	}
 	ensureSidecar(name)
 	docker("start", "ts-"+name, "mc-"+name)
+	applyGamerules(name)
 	back(w, r)
 }
 
@@ -1288,6 +1334,7 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	}
 	ensureSidecar(name)
 	docker("restart", "mc-"+name)
+	applyGamerules(name)
 	back(w, r)
 }
 
@@ -1303,6 +1350,7 @@ func updateWorld(w http.ResponseWriter, r *http.Request) {
 	docker("pull", bedrockImage)
 	regen()
 	composeUpArgs(name, true)
+	applyGamerules(name)
 	back(w, r)
 }
 
@@ -1365,6 +1413,53 @@ func command(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// ---------- gamerule toggles ----------
+
+// gamerules maps a world's family-friendly toggles to the console commands
+// that realize them. Every rule is always emitted — including the vanilla
+// value when a toggle is off — so unchecking a box in the panel actually
+// reverts the world instead of leaving it however it last was.
+func gamerules(w world) [][2]string {
+	pick := func(on bool, yes, no string) string {
+		if on {
+			return yes
+		}
+		return no
+	}
+	return [][2]string{
+		{"playersleepingpercentage", pick(w.OneSleep, "1", "100")},
+		{"keepinventory", strconv.FormatBool(w.KeepInv)},
+		{"mobgriefing", strconv.FormatBool(!w.NoMobGrief)},
+		{"showcoordinates", strconv.FormatBool(w.ShowCoords)},
+	}
+}
+
+var gameruleRetryDelay = 5 * time.Second
+
+// applyGamerules pushes the world's toggles once the server is up. Async
+// because a booting world takes ~30s to accept console commands; gamerules
+// persist in the world save, so re-applying on every lifecycle event is
+// harmless and keeps the panel's checkboxes authoritative.
+func applyGamerules(name string) {
+	go func() {
+		for i := 0; i < 24; i++ { // up to ~2 minutes
+			if worldStatus(name) == "running" {
+				wd := findWorld(load(), name)
+				if wd == nil {
+					return
+				}
+				for _, g := range gamerules(*wd) {
+					if err := sendCommand(name, []string{"gamerule", g[0], g[1]}); err != nil {
+						log.Printf("gamerule %s %s on %s: %v", g[0], g[1], name, err)
+					}
+				}
+				return
+			}
+			time.Sleep(gameruleRetryDelay)
+		}
+	}()
 }
 
 // ---------- backups ----------

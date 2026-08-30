@@ -1,12 +1,16 @@
 {{define "content"}}
 <header>
  <h1>&#9968; homerealm</h1>
- {{if .Identity}}<span class="chip" title="your Tailscale identity">&#128100; {{.Identity}} &middot; {{.Role}}</span>{{end}}
+ <div class="headright">
+  {{if .Identity}}<span class="chip" title="your Tailscale identity">&#128100; {{.Identity}} &middot; {{.Role}}</span>{{end}}
+  {{if .CanCreate}}<button type="button" class="btn primary" id="newbtn">&#65291; New world</button>{{end}}
+ </div>
 </header>
 {{if .IsReader}}<div class="notice">&#128274; <b>Read-only view.</b> You&#8217;re not signed in via
 Tailscale &mdash; open the panel from a Tailscale device to create or manage worlds.</div>{{end}}
 {{if not .HasWorlds}}<div class="empty"><div class="bigmoji">&#9968;</div>
-<p><b>No worlds yet.</b><br>Create the first one below &mdash; it&#8217;ll be on your tailnet in about 30 seconds.</p></div>{{end}}
+<p><b>No worlds yet.</b><br>Tap <b>&#65291; New world</b> to create the first one &mdash; it&#8217;ll be on your tailnet in about 30 seconds.</p></div>{{end}}
+{{if .ShowFilter}}<input type="search" id="worldfilter" placeholder="Filter worlds&#8230;" aria-label="filter worlds by name" autocomplete="off">{{end}}
 {{range .Sections}}{{if .Title}}<h2>{{.Title}}</h2>{{end}}
 {{range .Worlds}}<div class="world" data-world="{{.Name}}">
  <div class="strip" style="background:{{.Strip}}"></div>
@@ -42,7 +46,8 @@ Tailscale &mdash; open the panel from a Tailscale device to create or manage wor
  </div>
 </div>
 {{end}}{{end}}
-{{if .CanCreate}}<div class="newbox"><b>New world</b>
+{{if .CanCreate}}<dialog id="newdlg" class="newdlg">
+<div class="newbox"><b>New world</b>
  <form method="post" action="/new">
   <div class="newrow">
    <input name="name" placeholder="world-name" pattern="[a-z0-9-]{1,20}" required aria-label="world name">
@@ -55,10 +60,43 @@ Tailscale &mdash; open the panel from a Tailscale device to create or manage wor
    <button type="button" class="btn" id="dice" title="random seed" aria-label="random seed">&#127922;</button>
    <label class="chip" style="min-height:42px"><input type="checkbox" name="flat" style="min-height:auto"> flat world</label>
   </div>
-  <button class="btn primary" data-busy="Creating&#8230;">Create world</button>
+  <div class="newrow">
+   <label class="chip" title="one player sleeping skips the night for everyone"><input type="checkbox" name="one_sleep" style="min-height:auto"> &#128564; one sleeps &#8594; day</label>
+   <label class="chip" title="no dropped items on death"><input type="checkbox" name="keep_inventory" style="min-height:auto"> &#127890; keep inventory</label>
+   <label class="chip" title="creepers and other mobs can't break builds"><input type="checkbox" name="no_mob_grief" style="min-height:auto"> &#128163; no creeper damage</label>
+   <label class="chip" title="show coordinates on screen"><input type="checkbox" name="show_coordinates" style="min-height:auto"> &#128205; show coordinates</label>
+  </div>
+  <div class="newrow">
+   <button class="btn primary" data-busy="Creating&#8230;">Create world</button>
+   <button type="button" class="btn" id="newcancel">Cancel</button>
+  </div>
  </form>
  <div class="meta" style="margin-top:.5rem">lowercase letters, numbers, dashes &middot; ready in ~30s &middot;
  joins your tailnet as <code>mc-&lt;name&gt;</code></div>
-</div>{{end}}
+</div>
+</dialog>{{end}}
 <p class="meta">{{.DiscoveryNote}}</p>
+{{end}}
+{{define "scripts"}}
+<script>
+(function () {
+  var btn = document.getElementById('newbtn');
+  var dlg = document.getElementById('newdlg');
+  if (btn && dlg) {
+    btn.addEventListener('click', function () {
+      dlg.showModal();
+      var i = dlg.querySelector('input[name=name]');
+      if (i) i.focus();
+    });
+    document.getElementById('newcancel').addEventListener('click', function () { dlg.close(); });
+  }
+  var f = document.getElementById('worldfilter');
+  if (f) f.addEventListener('input', function () {
+    var q = f.value.trim().toLowerCase();
+    document.querySelectorAll('.world[data-world]').forEach(function (c) {
+      c.hidden = q !== '' && c.dataset.world.indexOf(q) === -1;
+    });
+  });
+})();
+</script>
 {{end}}

@@ -64,6 +64,12 @@
    <label>max players <input name="max_players" type="number" min="1" max="30" value="{{.MaxPlayers}}" style="width:4.5em"></label>
    <label>view distance <input name="view_distance" type="number" min="5" max="32" value="{{.ViewDistance}}" style="width:4.5em"></label>
    <label>new players are <select name="default_permission">{{opts .Perms .DefaultPermission}}</select></label><br>
+   <div class="newrow" style="margin:.5rem 0">
+    <label class="chip" title="one player sleeping skips the night for everyone"><input type="checkbox" name="one_sleep" style="min-height:auto"{{if .OneSleep}} checked{{end}}> &#128564; one sleeps &#8594; day</label>
+    <label class="chip" title="no dropped items on death"><input type="checkbox" name="keep_inventory" style="min-height:auto"{{if .KeepInv}} checked{{end}}> &#127890; keep inventory</label>
+    <label class="chip" title="creepers and other mobs can't break builds"><input type="checkbox" name="no_mob_grief" style="min-height:auto"{{if .NoMobGrief}} checked{{end}}> &#128163; no creeper damage</label>
+    <label class="chip" title="show coordinates on screen"><input type="checkbox" name="show_coordinates" style="min-height:auto"{{if .ShowCoords}} checked{{end}}> &#128205; show coordinates</label>
+   </div>
    <button class="btn primary" data-busy="Applying&#8230;">Apply (restarts world)</button>
   </form>
   <div class="sectionhead">Players</div>
