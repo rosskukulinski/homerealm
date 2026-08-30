@@ -9,10 +9,62 @@ services:
     env_file: .env
     environment:
       DATA_DIR: /data
+      # Reach Docker only through the least-privilege proxy below — the panel
+      # no longer bind-mounts /var/run/docker.sock, so a compromise of the
+      # panel can't drive the raw Docker API. The `docker`/`docker compose`
+      # CLIs the panel shells out to honor DOCKER_HOST automatically.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
     # LAN access to the panel (PANEL_LISTEN_LAN); on the tailnet it serves
     # http(s)://<TS_HOSTNAME> directly — no port mapping involved.
     ports:
       - "${PANEL_PORT:-8090}:${PANEL_PORT:-8090}"
     volumes:
       - ${HOST_DATA_DIR}:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - docker-socket-proxy
+    networks:
+      - default        # outbound internet: tsnet, the Tailscale API, version checks
+      - docker-proxy   # private link to the socket proxy
+
+  # Least-privilege gateway to the Docker socket. The panel drives Docker only
+  # through this HAProxy, which whitelists just the API sections homerealm
+  # actually uses and blocks the dangerous rest (Swarm, Secrets, registry
+  # Auth, Build, Configs, …). The real socket is mounted READ-ONLY here and is
+  # never exposed to the panel's filesystem, the host, or the LAN.
+  #
+  # NOTE: homerealm must create/start/stop containers to do its job, so a full
+  # compromise of the PANEL could still craft a POST /containers/create and
+  # escape. The proxy shrinks the blast radius and removes the socket bind
+  # mount; it is not a complete containment boundary. Pin/upgrade the version
+  # deliberately.
+  docker-socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.5.0
+    container_name: homerealm-docker-proxy
+    restart: unless-stopped
+    environment:
+      # --- Read access (status / logs / stats / inspect; compose reconcile) ---
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      INFO: 1
+      # --- Writes the panel needs (compose up/down, pull, exec) ---
+      POST: 1          # allow non-GET methods on the sections enabled above
+      EXEC: 1          # docker exec: send-command (mc-*), tailscale status (ts-*)
+      ALLOW_START: 1   # docker start / compose up
+      ALLOW_STOP: 1    # docker stop / compose rm -s
+      ALLOW_RESTARTS: 1 # docker restart
+      # Everything else (AUTH, SECRETS, SWARM, BUILD, CONFIGS, NODES, PLUGINS,
+      # SERVICES, SYSTEM, TASKS, SESSION, GRPC, DISTRIBUTION) stays at its
+      # secure default of 0.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - docker-proxy
+
+networks:
+  default:
+  docker-proxy:
+    internal: true   # the proxy has no route off this network — it only needs the local socket
