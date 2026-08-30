@@ -3,6 +3,11 @@
 **A self-hosted, Realm-style panel for Minecraft Bedrock worlds — Tailscale-
 native, built for Synology NAS, works anywhere Docker runs.**
 
+[![CI](https://github.com/rosskukulinski/homerealm/actions/workflows/ci.yml/badge.svg)](https://github.com/rosskukulinski/homerealm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rosskukulinski/homerealm)](https://github.com/rosskukulinski/homerealm/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/rosskukulinski/homerealm?filename=app%2Fgo.mod)](app/go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ![homerealm panel](docs/screenshot.png)
 
 Run as many always-on Bedrock worlds as you like on hardware you own, and
@@ -255,6 +260,28 @@ LAN requests are read-only.
   the project name `-p homerealm-worlds`, or you'll orphan the containers.
 - **Child account can't join anything** — enable "join multiplayer games"
   in Xbox family settings.
+
+## Contributing
+
+Contributions are welcome — it's a small, approachable codebase (one Go binary,
+no database, no JS framework).
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — dev setup, the check suite CI enforces, and testing conventions.
+- **[CLAUDE.md](CLAUDE.md)** / **[AGENTS.md](AGENTS.md)** — architecture and conventions, written for humans and AI coding agents alike.
+- **[SECURITY.md](SECURITY.md)** — report a vulnerability privately (never a public issue).
+- **[Code of Conduct](CODE_OF_CONDUCT.md)**.
+
+Quick start for hacking on it — no Docker or tailnet needed to render templates
+and check routes:
+
+```bash
+cd app
+DATA_DIR=/tmp/hr HOST_DATA_DIR=/tmp/hr go run .   # LAN panel on :8090 (read-only)
+go test ./...                                     # full suite, no Docker required
+```
+
+Please open an issue before starting anything non-trivial, and run the full
+check suite (see CONTRIBUTING) before opening a PR.
 
 ## Credits
 
